@@ -1,108 +1,123 @@
-# --- Imports ---
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
-from decimal import Decimal
-import json
+# --- Config (adjust names only if your cols differ) ---------------------------
+GROUP_KEYS   = ["PARENT_REQUEST_ID", "APP_ID", "LOB"]
+DISPLAY_COLS = ["TEST_DESC", "EXECUTION_STATUS", "TOTAL_CNT", "SUCCESS_CNT", "FAILURE_CNT"]
+ORDER_IN_GROUP = ["TEST_DESC"]  # secondary sort inside each group
 
-# --- Assumes these exist from your context ---
-# MAX_THREADS, TIMEOUT_SECS, _log_lock, unique_triples
-# notebook_path_nc (list of notebook paths)
-# non_coalition_list (list of (scenario_id, lob_id, uw_req_id))
-# return_str_lob(lob_id)  -> str
-# dbutils, spark available in the Databricks runtime
+# If upstream names differ, map them here → standard names above
+RENAME = {
+    # "TS_STATUS": "EXECUTION_STATUS",
+    # "SUCCESS_S_CNT": "SUCCESS_CNT",
+    # "FAIL_CNT": "FAILURE_CNT",
+}
 
-# If you prefer: MAX_THREADS = min(len(notebook_path_nc), 12)
+# --- Normalize columns / derive missing counts --------------------------------
+import pandas as pd
+from html import escape as _esc
 
-run_user = dbutils.notebook.entry_point.getDbutils().notebook().getContext().userName().get()
-run_id = int(datetime.now().strftime("%d%m%Y%H%M%S"))
+df = email_table.copy()
+if RENAME:
+    df = df.rename(columns=RENAME)
 
-# Shared result, same type as before
-log_data = []
+# Derive success/failure if one is missing
+if "SUCCESS_CNT" not in df.columns and {"TOTAL_CNT", "FAILURE_CNT"} <= set(df.columns):
+    df["SUCCESS_CNT"] = df["TOTAL_CNT"] - df["FAILURE_CNT"]
+if "FAILURE_CNT" not in df.columns and {"TOTAL_CNT", "SUCCESS_CNT"} <= set(df.columns):
+    df["FAILURE_CNT"] = df["TOTAL_CNT"] - df["SUCCESS_CNT"]
 
-def _run_single_notebook(scenario_id: int, lob_id: int, uw_req_id: int, notebook_path: str) -> list[dict]:
-    """
-    Executes one notebook and returns a list of dicts to be appended to log_data.
-    Mirrors the old behavior/fields exactly. On failure, returns [] (old code only printed errors).
-    """
-    try:
-        print(f"Running notebook for scenario_id = {scenario_id}, lob = {lob_id}, uw_req_id = {uw_req_id}")
-        notebook_params = {
-            "scenario_id": scenario_id,
-            "lob": lob_id,
-            "uw_req_id": uw_req_id,
-            "run_id": run_id,
-        }
+needed = list(dict.fromkeys(GROUP_KEYS + DISPLAY_COLS))  # keep order, drop dups
+missing = [c for c in needed if c not in df.columns]
+if missing:
+    raise ValueError(f"Missing required columns for email rendering: {missing}. "
+                     f"Available: {sorted(df.columns.tolist())}")
 
-        print("Non_Coalition_loop")
-        start_time = datetime.utcnow()
-        # Use provided TIMEOUT_SECS to be consistent with your new config
-        output = dbutils.notebook.run(notebook_path, TIMEOUT_SECS, notebook_params)
-        notebook_status = "COMPLETED"
-        end_time = datetime.utcnow()
-        duration_sec = (end_time - start_time).total_seconds()
-        lob_name = return_str_lob(lob_id)
+# Keep only needed columns and sort for stable, readable output
+df = df[needed].copy()
 
-        # Keep your exact load/convert pattern (Delta -> pandas -> dicts) and Decimal->float conversion
-        temp_data = spark.read.format("delta").load(output)
-        df_conversion = (
-            temp_data.toPandas()
-            .applymap(lambda x: float(x) if isinstance(x, Decimal) else x)
-            .to_dict(orient="records")
-        )
-        json_dump = json.dumps(df_conversion)
-        list_of_dictionaries = json.loads(json_dump)
+# Ensure numeric columns are ints for clean HTML
+for c in ["TOTAL_CNT", "SUCCESS_CNT", "FAILURE_CNT"]:
+    if c in df.columns:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype("int64")
 
-        # Add the same metadata keys/values you currently add
-        for metadat_insert in list_of_dictionaries:
-            metadat_insert["lob"] = lob_name
-            metadat_insert["run_id"] = run_id
-            metadat_insert["start_time"] = start_time.isoformat()
-            metadat_insert["end_time"] = end_time.isoformat()
-            metadat_insert["duration"] = duration_sec
-            metadat_insert["TS_CTG"] = notebook_path.split("/")[-1]
-            metadat_insert["EXECUTION_STATUS"] = notebook_status
-            metadat_insert["REQUEST_ID"] = "NA"
-            metadat_insert["TASK_ID"] = "NA"
-            metadat_insert["RUN_USER"] = run_user
-            metadat_insert["PARENT_REQUEST_ID"] = uw_req_id
-            metadat_insert["APP_ID"] = scenario_id
+sort_cols = GROUP_KEYS + [c for c in ORDER_IN_GROUP if c in df.columns]
+df = df.sort_values(sort_cols, kind="stable").reset_index(drop=True)
 
-        print(f"scenario_id {scenario_id}  lob {lob_name}  uw_req_id {uw_req_id}  run_id = {run_id}")
-        print(notebook_path)
-        print("Non_Coalition_loop_ends")
-        print("\n\n", output)
+# --- Styles (inline CSS is safest for email clients) --------------------------
+CSS = """
+<style>
+  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
+  h3{margin:0 0 10px}
+  h4{margin:14px 0 6px}
+  .kv{font-size:13px;margin:0 0 6px}
+  .divider{margin:12px 0;border:none;border-top:1px solid #e5e7eb}
+  table.regtable{border-collapse:collapse;width:860px;max-width:100%}
+  .regtable th,.regtable td{border:1px solid #e5e7eb;padding:6px 8px;text-align:center}
+  .regtable th{background:#f8fafc;text-transform:uppercase;font-size:12px;letter-spacing:.02em}
+  .good{color:#0e7c2f;font-weight:600}
+  .bad{color:#b00020;font-weight:600}
+  .bg-good{background:#f2fff5}
+  .bg-bad{background:#fff2f3}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+</style>
+"""
 
-        return list_of_dictionaries
+# --- HTML rendering helpers ---------------------------------------------------
+def _render_table_block(keys_dict: dict, gdf: pd.DataFrame, display_cols: list[str]) -> str:
+    # Header with the 3 key fields
+    header = (
+        "<h4>Group</h4>"
+        f"<p class='kv'>{GROUP_KEYS[0]}: <span class='mono'>{_esc(str(keys_dict[GROUP_KEYS[0]]))}</span> "
+        f"&nbsp;|&nbsp; {GROUP_KEYS[1]}: <span class='mono'>{_esc(str(keys_dict[GROUP_KEYS[1]]))}</span> "
+        f"&nbsp;|&nbsp; {GROUP_KEYS[2]}: <span class='mono'>{_esc(str(keys_dict[GROUP_KEYS[2]]))}</span></p>"
+    )
 
-    except Exception as e:
-        # Preserve old behavior: log/print, do not append any result rows on failure
-        print(f"Error running notebook: {e}")
-        return []
+    # Table head
+    thead = "<thead><tr>" + "".join(f"<th>{_esc(col)}</th>" for col in display_cols) + "</tr></thead>"
 
+    # Table rows with conditional coloring
+    rows_html = []
+    for _, row in gdf[display_cols].iterrows():
+        failure_cnt = int(row.get("FAILURE_CNT", 0)) if str(row.get("FAILURE_CNT", "")).strip() != "" else 0
+        total_cnt   = int(row.get("TOTAL_CNT", -1)) if str(row.get("TOTAL_CNT", "")).strip() != "" else -1
+        success_cnt = int(row.get("SUCCESS_CNT", -1)) if str(row.get("SUCCESS_CNT", "")).strip() != "" else -1
 
-# ----------------- Parallel Orchestration -----------------
-# Build all tasks across unique triples × all notebooks
-tasks = []
-for (scenario_id, lob_id, uw_req_id) in unique_triples:
-    for notebook_path in notebook_path_nc:
-        tasks.append((scenario_id, lob_id, uw_req_id, notebook_path))
+        # row bg: red if any failures, green if all success, neutral otherwise
+        row_cls = "bg-bad" if failure_cnt > 0 else ("bg-good" if total_cnt >= 0 and success_cnt == total_cnt else "")
+        tds = []
+        for col in display_cols:
+            val = row[col]
+            if col == "EXECUTION_STATUS":
+                s = str(val).upper()
+                status_cls = "bad" if "FAIL" in s else ("good" if s in ("COMPLETED", "PASS") else "")
+                tds.append(f"<td class='{status_cls}'>{_esc(str(val))}</td>")
+            else:
+                tds.append(f"<td>{_esc(str(val))}</td>")
+        rows_html.append(f"<tr class='{row_cls}'>" + "".join(tds) + "</tr>")
 
-# Run with a bounded thread-pool
-# Note: Spark & dbutils calls are made inside worker threads; Databricks supports this pattern for notebook runs.
-with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-    futures = {
-        executor.submit(_run_single_notebook, sid, lob, uw, npath): (sid, lob, uw, npath)
-        for (sid, lob, uw, npath) in tasks
-    }
+    tbody = "<tbody>" + "".join(rows_html) + "</tbody>"
+    return header + f"<table class='regtable'>{thead}{tbody}</table>"
 
-    for future in as_completed(futures):
-        result_rows = future.result()  # always a list (possibly empty)
-        if result_rows:
-            # Keep log_data identical to old structure; extend under a lock for safety
-            with _log_lock:
-                log_data.extend(result_rows)
+# --- Build the per-group sections --------------------------------------------
+sections = []
+for keys, g in df.groupby(GROUP_KEYS, dropna=False, sort=False):
+    key_vals = dict(zip(GROUP_KEYS, keys))
+    sections.append(_render_table_block(key_vals, g, [c for c in DISPLAY_COLS if c in g.columns]))
 
-# At this point, log_data has exactly the same structure/content shape you produced before.
-# If your old cell relied on the variable existing (not function return), we simply leave it bound:
-# log_data  # <- same list[dict] as before
+# --- Final HTML body + CSV attachment bytes ----------------------------------
+html_body = f"""
+<html>
+  <head>{CSS}</head>
+  <body>
+    <h3>QAAP Daily Regression – Integrated Tests</h3>
+    <p>Validations: {len(df)}</p>
+    {'<hr class="divider">'.join(sections)}
+  </body>
+</html>
+"""
+
+# CSV uses the same sorted frame so the order matches the email
+csv_bytes = df.to_csv(index=False).encode("utf-8")
+
+# Example usage with your mail helper:
+# send_email(subject="QAAP Daily Regression – Integrated Tests",
+#            html_body=html_body,
+#            attachments=[("ce_regression_summary_daily_result.csv", csv_bytes)])
