@@ -1,152 +1,108 @@
-# Databricks notebook source
-# Parallel fan-out: one thread per notebook; sequential per-notebook across param triples.
+# --- Imports ---
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from decimal import Decimal
-import json, threading
+import json
 
-# ---- Inputs you already have -------------------------------------------------
-# notebook_paths_nc: List[str]     # notebooks to call
-# non_coalition_list: List[Tuple[scenario_id, lob_id, uw_req_id]]
-# return_str_lob: Callable[[Any], str]  # your existing helper
+# --- Assumes these exist from your context ---
+# MAX_THREADS, TIMEOUT_SECS, _log_lock, unique_triples
+# notebook_path_nc (list of notebook paths)
+# non_coalition_list (list of (scenario_id, lob_id, uw_req_id))
+# return_str_lob(lob_id)  -> str
+# dbutils, spark available in the Databricks runtime
 
-# ---- Concurrency knobs -------------------------------------------------------
-MAX_THREADS   = min(len(notebook_paths_nc), 8)      # cap threads
-TIMEOUT_SECS  = 6 * 60 * 60                         # generous timeout for each run
+# If you prefer: MAX_THREADS = min(len(notebook_path_nc), 12)
 
-# ---- Run context / shared log ------------------------------------------------
 run_user = dbutils.notebook.entry_point.getDbutils().notebook().getContext().userName().get()
-run_id   = int(datetime.now().strftime("%Y%m%d%H%M%S"))
-log_data = []                # list of dicts (same as your current design)
-_log_lock = threading.Lock() # protects log_data
+run_id = int(datetime.now().strftime("%d%m%Y%H%M%S"))
 
-# ---- De-duplicate triples ----------------------------------------------------
-unique_triples = list({(sid, lob, uw) for (sid, lob, uw) in non_coalition_list})
+# Shared result, same type as before
+log_data = []
 
-# ---- Helpers -----------------------------------------------------------------
-def _read_output_as_spark_df(path: str):
+def _run_single_notebook(scenario_id: int, lob_id: int, uw_req_id: int, notebook_path: str) -> list[dict]:
     """
-    Your called notebook returns a location in `output`.
-    Try Delta first, then Parquet fallback, then CSV as last resort.
+    Executes one notebook and returns a list of dicts to be appended to log_data.
+    Mirrors the old behavior/fields exactly. On failure, returns [] (old code only printed errors).
     """
     try:
-        return spark.read.format("delta").load(path)
-    except Exception:
-        try:
-            return spark.read.parquet(path)
-        except Exception:
-            try:
-                return spark.read.csv(path, header=True, inferSchema=True)
-            except Exception:
-                return None
+        print(f"Running notebook for scenario_id = {scenario_id}, lob = {lob_id}, uw_req_id = {uw_req_id}")
+        notebook_params = {
+            "scenario_id": scenario_id,
+            "lob": lob_id,
+            "uw_req_id": uw_req_id,
+            "run_id": run_id,
+        }
 
-def _append_records_to_log(
-    *,
-    records: list[dict],
-    notebook_path: str,
-    scenario_id,
-    lob_id,
-    uw_req_id,
-    status: str,
-    start_time: datetime,
-    end_time: datetime,
-    output_path: str | None,
-    error_repr: str | None
-):
-    """Enrich each record with your metadata and push to shared log_data."""
-    lob_name = return_str_lob(lob_id)
-    duration = (end_time - start_time).total_seconds()
-    est_ctg  = notebook_path.split("/")[-1]  # mimic your IS_CTG derivation
+        print("Non_Coalition_loop")
+        start_time = datetime.utcnow()
+        # Use provided TIMEOUT_SECS to be consistent with your new config
+        output = dbutils.notebook.run(notebook_path, TIMEOUT_SECS, notebook_params)
+        notebook_status = "COMPLETED"
+        end_time = datetime.utcnow()
+        duration_sec = (end_time - start_time).total_seconds()
+        lob_name = return_str_lob(lob_id)
 
-    enriched = []
-    for rec in (records or [{}]):  # if no rows, still write one summary row
-        rec = dict(rec)  # copy to avoid mutating Pandas-derived dict
-        rec["lob"]              = lob_name
-        rec["run_id"]           = run_id
-        rec["start_time"]       = start_time.isoformat()
-        rec["end_time"]         = end_time.isoformat()
-        rec["duration"]         = duration
-        rec["IS_CTG"]           = est_ctg
-        rec["EXECUTION_STATUS"] = status
-        rec["REQUEST_ID"]       = "NA"
-        rec["TASK_ID"]          = "NA"
-        rec["RUN_USER"]         = run_user
-        rec["PARENT_REQUEST_ID"]= uw_req_id
-        rec["APP_ID"]           = scenario_id
-        rec["notebook"]         = notebook_path
-        rec["output_path"]      = output_path
-        rec["error"]            = error_repr
-        enriched.append(rec)
+        # Keep your exact load/convert pattern (Delta -> pandas -> dicts) and Decimal->float conversion
+        temp_data = spark.read.format("delta").load(output)
+        df_conversion = (
+            temp_data.toPandas()
+            .applymap(lambda x: float(x) if isinstance(x, Decimal) else x)
+            .to_dict(orient="records")
+        )
+        json_dump = json.dumps(df_conversion)
+        list_of_dictionaries = json.loads(json_dump)
 
-    with _log_lock:
-        log_data.extend(enriched)
+        # Add the same metadata keys/values you currently add
+        for metadat_insert in list_of_dictionaries:
+            metadat_insert["lob"] = lob_name
+            metadat_insert["run_id"] = run_id
+            metadat_insert["start_time"] = start_time.isoformat()
+            metadat_insert["end_time"] = end_time.isoformat()
+            metadat_insert["duration"] = duration_sec
+            metadat_insert["TS_CTG"] = notebook_path.split("/")[-1]
+            metadat_insert["EXECUTION_STATUS"] = notebook_status
+            metadat_insert["REQUEST_ID"] = "NA"
+            metadat_insert["TASK_ID"] = "NA"
+            metadat_insert["RUN_USER"] = run_user
+            metadat_insert["PARENT_REQUEST_ID"] = uw_req_id
+            metadat_insert["APP_ID"] = scenario_id
 
-def _spark_df_to_records(df):
-    """
-    Your current pipeline: Spark -> Pandas -> Decimal-safe dict(records).
-    """
-    if df is None:
+        print(f"scenario_id {scenario_id}  lob {lob_name}  uw_req_id {uw_req_id}  run_id = {run_id}")
+        print(notebook_path)
+        print("Non_Coalition_loop_ends")
+        print("\n\n", output)
+
+        return list_of_dictionaries
+
+    except Exception as e:
+        # Preserve old behavior: log/print, do not append any result rows on failure
+        print(f"Error running notebook: {e}")
         return []
 
-    pdf = df.toPandas()
-    # Convert Decimal to float safely (mimics your applymap + to_dict('records'))
-    safe_pdf = pdf.applymap(lambda x: float(x) if isinstance(x, Decimal) else x)
-    return json.loads(json.dumps(safe_pdf.to_dict(orient="records")))
 
-# ---- Core worker: runs one notebook for one triple --------------------------
-def run_one_invocation(notebook_path: str, triple):
-    scenario_id, lob_id, uw_req_id = triple
-    params = {
-        "scenario_id": scenario_id,
-        "lob":         lob_id,
-        "uw_req_id":   uw_req_id,
-        "run_id":      run_id,
+# ----------------- Parallel Orchestration -----------------
+# Build all tasks across unique triples × all notebooks
+tasks = []
+for (scenario_id, lob_id, uw_req_id) in unique_triples:
+    for notebook_path in notebook_path_nc:
+        tasks.append((scenario_id, lob_id, uw_req_id, notebook_path))
+
+# Run with a bounded thread-pool
+# Note: Spark & dbutils calls are made inside worker threads; Databricks supports this pattern for notebook runs.
+with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+    futures = {
+        executor.submit(_run_single_notebook, sid, lob, uw, npath): (sid, lob, uw, npath)
+        for (sid, lob, uw, npath) in tasks
     }
 
-    start = datetime.utcnow()
-    status = "COMPLETED"
-    output_path = None
-    err = None
+    for future in as_completed(futures):
+        result_rows = future.result()  # always a list (possibly empty)
+        if result_rows:
+            # Keep log_data identical to old structure; extend under a lock for safety
+            with _log_lock:
+                log_data.extend(result_rows)
 
-    try:
-        # This returns the output string from the child notebook (e.g., a path)
-        output_path = dbutils.notebook.run(notebook_path, TIMEOUT_SECS, params)
-        df = _read_output_as_spark_df(output_path)
-        records = _spark_df_to_records(df)
-    except Exception as e:
-        status = "FAILED"
-        err = repr(e)
-        records = []  # still log a row with error & metadata
-
-    end = datetime.utcnow()
-    _append_records_to_log(
-        records=records,
-        notebook_path=notebook_path,
-        scenario_id=scenario_id,
-        lob_id=lob_id,
-        uw_req_id=uw_req_id,
-        status=status,
-        start_time=start,
-        end_time=end,
-        output_path=output_path,
-        error_repr=err,
-    )
-
-# ---- Per-notebook worker: sequential over triples for that notebook ---------
-def per_notebook_worker(notebook_path: str, triples):
-    for t in triples:
-        run_one_invocation(notebook_path, t)
-
-# ---- Fan-out: one thread per notebook ---------------------------------------
-with ThreadPoolExecutor(max_workers=MAX_THREADS) as pool:
-    futs = [pool.submit(per_notebook_worker, nb, unique_triples) for nb in notebook_paths_nc]
-    for f in as_completed(futs):
-        # Exceptions already captured per invocation, but catch worker-level issues too.
-        try:
-            f.result()
-        except Exception as e:
-            print(f"[Worker crashed] {e!r}")
-
-# ---- Done: log_data now mirrors your current structure, across all runs -----
-print(f"Parallel run complete: {len(log_data)} records written; run_id={run_id}")
-display(spark.createDataFrame(log_data))
+# At this point, log_data has exactly the same structure/content shape you produced before.
+# If your old cell relied on the variable existing (not function return), we simply leave it bound:
+# log_data  # <- same list[dict] as before
