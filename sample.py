@@ -1,8 +1,10 @@
+
+
 # -*- coding: utf-8 -*-
 """Pure helpers for parsing SQS event bodies and mapping failures.
 
 This module intentionally performs **no** network I/O. It provides:
-  • tolerant JSON parsing (handles double-encoded JSON strings, stray backslashes, newlines)
+  • tolerant JSON parsing (double-encoded JSON strings, stray backslashes, newlines)
   • extraction of business messages from SQS `body` strings
   • flattening an entire Lambda `event` to (messageId, body) pairs
   • mapping failed inner message bodies back to outer SQS messageIds
@@ -12,21 +14,42 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any, Dict, List, Tuple
 
 logger = logging.getLogger(__name__)
 
 
+def _try_json_unwrap(text: str) -> Any:
+    """Attempt up to 3 json.loads passes to unwrap double-encoded JSON strings."""
+    last_parsed = None
+    for _ in range(3):
+        try:
+            parsed = json.loads(text)
+            last_parsed = parsed
+        except Exception:
+            return last_parsed, False
+        if isinstance(parsed, str):
+            text = parsed
+            continue
+        return parsed, True
+    return last_parsed, not isinstance(last_parsed, str)
+
+
 def _json_loads_relaxed(raw: Any) -> Any:
     """Parses JSON with tolerance for double-encoded, escaped, or newline-padded content.
 
-    The function:
-      • Returns non-strings unchanged.
-      • For strings, first normalizes common producer issues:
-        - Collapsed newlines are removed.
-        - Double backslashes (“\\\\”) are reduced to single (“\\”) so JSON escapes are valid.
-      • Tries up to 3 `json.loads` passes (handles double-encoding).
-      • If a later pass fails, returns the last successful parse; if none succeeded, returns `raw`.
+    Strategy:
+      • Non-strings are returned unchanged.
+      • For strings, build a sequence of *sanitized candidates* and try each:
+          1) original stripped
+          2) remove CR/LF
+          3) collapse multi-backslashes (e.g., '\\\\' → '\\')
+          4) as a last resort, remove backslashes before quotes (e.g., '\\"' → '"')
+        For each candidate, attempt up to 3 json.loads passes to unwrap double encoding.
+      • If any candidate yields a non-string JSON value, return it.
+      • Otherwise, if we decoded at least once to a string, return the last decoded string.
+      • If all attempts fail, return the original input.
 
     Args:
         raw: Value that may be JSON or a JSON string.
@@ -39,34 +62,39 @@ def _json_loads_relaxed(raw: Any) -> Any:
         '123'
         >>> _json_loads_relaxed(json.dumps(json.dumps({"a": 1})))
         {'a': 1}
-        >>> _json_loads_relaxed('{\\\\\"a\\\\\":1}')  # '{\\\"a\\\":1}' → '{"a":1}'
-        {'a': 1}
+        >>> _json_loads_relaxed('{\\\\\"k\\\\\":1}\\n')
+        {'k': 1}
         >>> _json_loads_relaxed('not-json')
         'not-json'
     """
     if not isinstance(raw, str):
         return raw
 
-    text = raw.strip()
-    # Normalize common producer artifacts (backslashes, newlines)
-    if "\\\\" in text:
-        text = text.replace("\\\\", "\\")
-    if "\n" in text:
-        text = text.replace("\n", "")
+    base = raw.strip()
 
-    last_parsed = None
-    for _ in range(3):
-        try:
-            parsed = json.loads(text)
-            last_parsed = parsed
-        except Exception:
-            return last_parsed if last_parsed is not None else raw
+    candidates: List[str] = [base]
+
+    no_newlines = base.replace("\n", "").replace("\r", "")
+    if no_newlines != base:
+        candidates.append(no_newlines)
+
+    collapsed = re.sub(r"\\{2,}", r"\\", no_newlines)
+    if collapsed not in candidates:
+        candidates.append(collapsed)
+
+    unescape_quotes = collapsed.replace('\\"', '"')
+    if unescape_quotes not in candidates:
+        candidates.append(unescape_quotes)
+
+    last_str: Any = None
+    for cand in candidates:
+        parsed, ok = _try_json_unwrap(cand)
+        if ok:
+            return parsed
         if isinstance(parsed, str):
-            text = parsed
-            continue
-        return parsed
+            last_str = parsed
 
-    return last_parsed if last_parsed is not None else raw
+    return last_str if last_str is not None else raw
 
 
 def _extract_records_tree(obj: Any) -> List[Dict[str, Any]]:
@@ -143,14 +171,13 @@ def extract_messages_from_body(body: str) -> List[str]:
     for record in _extract_records_tree(parsed):
         chosen = record.get("payload", record)
         if isinstance(chosen, str):
-            chosen = _json_loads_relaxed(chosen)  # unwrap inner JSON string if necessary
+            chosen = _json_loads_relaxed(chosen)
         try:
             messages.append(json.dumps(chosen, separators=(",", ":"), ensure_ascii=False))
         except Exception:
             logger.error("Failed to serialize payload/record; forwarding as str")
             messages.append(str(chosen))
 
-    # If nothing matched but parsed value is a plain JSON string, forward that
     if not messages and isinstance(parsed, str):
         messages.append(parsed)
 
@@ -159,10 +186,6 @@ def extract_messages_from_body(body: str) -> List[str]:
 
 def explode_sqs_event_to_messages(event: Dict[str, Any]) -> List[Tuple[str, str]]:
     """Expands an SQS event into a flat list of (messageId, messageBody) pairs.
-
-    Each outer SQS Record can contain multiple inner business messages inside its
-    `body`. This function extracts them all and preserves a link to the outer
-    `messageId` for later partial-failure reporting.
 
     Args:
         event: The full Lambda event payload containing `Records`.
@@ -195,10 +218,6 @@ def build_batch_item_failures(
 ) -> List[Dict[str, str]]:
     """Builds the Lambda response for failed SQS messages.
 
-    Maps failed inner message bodies back to their original outer `messageId`s.
-    Ensures only one failure per outer `messageId` is reported, as required by
-    SQS for partial-batch response handling.
-
     Args:
         flattened_pairs: List of (messageId, body) pairs from
             `explode_sqs_event_to_messages`.
@@ -227,7 +246,9 @@ def build_batch_item_failures(
 
 
 
-#####################################
+
+
+#################################################
 
 
 # -*- coding: utf-8 -*-
@@ -235,11 +256,13 @@ import json
 import os
 import sys
 import unittest
+from unittest.mock import patch
 
-# Make <repo>/src importable so `from utils.helpers import ...` works
+# Add <repo>/src to sys.path so `from utils.helpers import ...` resolves.
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 
 from utils.helpers import (  # noqa: E402
+    _try_json_unwrap,
     _json_loads_relaxed,
     _extract_records_tree,
     extract_messages_from_body,
@@ -248,7 +271,23 @@ from utils.helpers import (  # noqa: E402
 )
 
 
+class TestTryJsonUnwrap(unittest.TestCase):
+    def test_try_unwrap_success_nonstring(self):
+        parsed, ok = _try_json_unwrap("1")
+        self.assertEqual(parsed, 1)
+        self.assertTrue(ok)
+
+    def test_try_unwrap_last_success_string_not_ok(self):
+        # First pass yields a plain string, second pass fails -> ok == False
+        parsed, ok = _try_json_unwrap('"hello"')
+        self.assertEqual(parsed, "hello")
+        self.assertFalse(ok)
+
+
 class TestJsonLoadsRelaxed(unittest.TestCase):
+    def test_returns_non_string_unchanged(self):
+        self.assertEqual(_json_loads_relaxed(123), 123)
+
     def test_single_encoded_string(self):
         self.assertEqual(_json_loads_relaxed('"hello"'), "hello")
 
@@ -265,10 +304,13 @@ class TestJsonLoadsRelaxed(unittest.TestCase):
         self.assertEqual(_json_loads_relaxed("<<bad>>"), "<<bad>>")
 
     def test_backslashes_and_newlines_are_normalized(self):
-        # Simulate payload with double backslashes and newlines like your logs
-        s = '{\\\\\"k\\\\\":1}\n'
+        s = '{\\\\\"k\\\\\":1}\\n'  # becomes {\"k\":1}\n at runtime
         parsed = _json_loads_relaxed(s)
         self.assertEqual(parsed, {"k": 1})
+
+    def test_last_success_returns_decoded_string(self):
+        # '"hi"' -> first pass 'hi' (string), second pass fails, so return 'hi'
+        self.assertEqual(_json_loads_relaxed('"hi"'), "hi")
 
 
 class TestExtractRecordsTree(unittest.TestCase):
@@ -283,8 +325,13 @@ class TestExtractRecordsTree(unittest.TestCase):
     def test_single_record_dict(self):
         self.assertEqual(len(_extract_records_tree({"meta": {"ref": "1:0"}})), 1)
 
-    def test_ignores_strings(self):
+    def test_list_of_plain_records(self):
+        obj = [{"payload": {"p": 1}}, {"payload": {"p": 2}}]
+        self.assertEqual(len(_extract_records_tree(obj)), 2)
+
+    def test_ignores_strings_and_empty(self):
         self.assertEqual(_extract_records_tree("nope"), [])
+        self.assertEqual(_extract_records_tree([]), [])
 
 
 class TestExtractMessagesFromBody(unittest.TestCase):
@@ -302,8 +349,6 @@ class TestExtractMessagesFromBody(unittest.TestCase):
         self.assertEqual(extract_messages_from_body(json.dumps("just a json string")), ["just a json string"])
 
     def test_double_encoded_payloads_two_messages(self):
-        # Mirrors your CloudWatch example: two records, each payload is a JSON string,
-        # with producer artifacts (double backslashes and newlines).
         payload_dict = {
             "account_key": "test_tban",
             "account_key_type": "TOKENIZEDDBAN",
@@ -312,25 +357,37 @@ class TestExtractMessagesFromBody(unittest.TestCase):
             "program_code": "TEST1234",
             "source_id": "BANK1",
         }
-        # Build "noisy" string like your logs: {\\\"...\\\"}\n
-        noisy_payload = json.dumps(payload_dict)           # '{"account_key":"test_tban",...}'
-        noisy_payload = noisy_payload.replace("\\", "\\\\") + "\n"  # escape backslashes + newline
-
+        noisy = json.dumps(payload_dict).replace("\\", "\\\\") + "\n"
         body = json.dumps({
             "version": 2,
             "batchMeta": {"schemaId": "x", "region": "1"},
             "records": [
-                {"meta": {"ref": "1:0"}, "payload": noisy_payload},
-                {"meta": {"ref": "1:0"}, "payload": noisy_payload},
+                {"meta": {"ref": "1:0"}, "payload": noisy},
+                {"meta": {"ref": "1:0"}, "payload": noisy},
             ],
         })
-
         msgs = extract_messages_from_body(body)
         self.assertEqual(len(msgs), 2)
         parsed = [json.loads(m) for m in msgs]
         self.assertEqual(parsed[0]["account_key"], "test_tban")
         self.assertTrue(parsed[0]["is_enrollment_active"])
         self.assertEqual(parsed[1]["program_code"], "TEST1234")
+
+    def test_serialize_exception_falls_back_to_str(self):
+        body = json.dumps({"records": [{"payload": {"k": 1}}]})
+
+        # Patch json.dumps to raise only when called on dicts (chosen will be a dict)
+        real_dumps = json.dumps
+
+        def flaky(obj, *a, **kw):
+            if isinstance(obj, dict):
+                raise TypeError("boom")
+            return real_dumps(obj, *a, **kw)
+
+        with patch("utils.helpers.json.dumps", side_effect=flaky):
+            msgs = extract_messages_from_body(body)
+            # When serialization fails, we append str(chosen) → single quotes expected
+            self.assertEqual(msgs, ["{'k': 1}"])
 
 
 class TestExplodeAndFailures(unittest.TestCase):
@@ -342,17 +399,14 @@ class TestExplodeAndFailures(unittest.TestCase):
             ]
         }
         pairs = explode_sqs_event_to_messages(event)
-
-        # Optional: print for debugging
-        print("\nFlattened message pairs:")
-        for sid, body in pairs:
-            print(f"  messageId={sid}, body={body}")
-
         self.assertEqual([(sid, json.loads(b)["id"]) for sid, b in pairs], [("A", 1), ("A", 2), ("B", 3)])
 
-    def test_build_batch_item_failures_dedupes_by_outer_id(self):
+    def test_explode_handles_empty_event(self):
+        self.assertEqual(explode_sqs_event_to_messages({"Records": []}), [])
+
+    def test_build_batch_item_failures_dedupes_and_ignores_unknown(self):
         flattened = [("A", '{"k":1}'), ("A", '{"k":2}'), ("B", '{"k":3}')]
-        failed = ['{"k":2}', '{"k":3}']
+        failed = ['{"k":2}', '{"k":999}', '{"k":3}']  # 999 is unknown and ignored
         self.assertCountEqual(
             build_batch_item_failures(flattened, failed),
             [{"itemIdentifier": "A"}, {"itemIdentifier": "B"}],
@@ -361,4 +415,5 @@ class TestExplodeAndFailures(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
 
