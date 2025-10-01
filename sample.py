@@ -26,8 +26,10 @@ def explode_sqs_event_to_payloads(event: Dict[str, Any]) -> List[Tuple[str, str]
     Example:
         >>> event = {
         ...   "Records": [
-        ...     {"messageId": "A", "body": {"records": [{"payload": {"id": 1}}, {"payload": {"id": 2}}]}},
-        ...     {"messageId": "B", "body": '{"records":[{"payload":{"id":3}}]}'}
+        ...     {"messageId": "A",
+        ...      "body": {"records":[{"payload":{"id":1}}, {"payload":{"id":2}}]}},
+        ...     {"messageId": "B",
+        ...      "body": '{"records":[{"payload":{"id":3}}]}'}
         ...   ]
         ... }
         >>> explode_sqs_event_to_payloads(event)
@@ -35,8 +37,9 @@ def explode_sqs_event_to_payloads(event: Dict[str, Any]) -> List[Tuple[str, str]
     """
     results: List[Tuple[str, str]] = []
 
-    for rec in event.get("Records", []):
-        msg_id = rec.get("messageId") or rec.get("messageid")  # defensive
+    for rec in (event.get("Records") or []):
+        # Be defensive around case/shape
+        msg_id = rec.get("messageId") or rec.get("messageid")
         if not msg_id:
             logger.debug("Skipping record without messageId: %r", rec)
             continue
@@ -48,31 +51,33 @@ def explode_sqs_event_to_payloads(event: Dict[str, Any]) -> List[Tuple[str, str]
 
         body_obj = _loads_multipass(body_raw)
 
-        # Typical shape from your examples:
-        # {"version":"...","batchMeta":{...},"records":[[{"meta":{...},"payload":"<json>"}]]}
+        # Common shape: {"version": "...", "records": [[{ "payload": ... }, ...]]}
         if isinstance(body_obj, dict) and "records" in body_obj:
             for inner in _flatten_records(body_obj["records"]):
-                if not isinstance(inner, dict):
-                    continue
-                if "payload" not in inner:
-                    continue
-                payload_raw = inner["payload"]
-                payload_obj = _loads_multipass(payload_raw)
-                payload_str = _to_json_string(payload_obj)
-                results.append((msg_id, payload_str))
+                if isinstance(inner, dict) and "payload" in inner:
+                    payload_obj = _loads_multipass(inner["payload"])
+                    results.append((msg_id, _to_json_string(payload_obj)))
             continue
 
-        # Fallbacks: be liberal but deterministic
+        # If body has a single "payload" but that payload itself decodes to a container
+        # that includes "records", flatten those as well (bytes/escaped-string cases).
         if isinstance(body_obj, dict) and "payload" in body_obj:
             payload_obj = _loads_multipass(body_obj["payload"])
-            results.append((msg_id, _to_json_string(payload_obj)))
+            if isinstance(payload_obj, dict) and "records" in payload_obj:
+                for inner in _flatten_records(payload_obj["records"]):
+                    if isinstance(inner, dict) and "payload" in inner:
+                        inner_payload = _loads_multipass(inner["payload"])
+                        results.append((msg_id, _to_json_string(inner_payload)))
+            else:
+                results.append((msg_id, _to_json_string(payload_obj)))
             continue
 
+        # Treat body dict (without records/payload) as the payload itself.
         if isinstance(body_obj, dict):
-            # Treat entire body as the payload if it looks like a self-contained request
             results.append((msg_id, _to_json_string(body_obj)))
             continue
 
+        # Body is a JSON string for the payload container/object.
         if isinstance(body_obj, str) and _looks_like_json(body_obj):
             payload_obj = _loads_multipass(body_obj)
             results.append((msg_id, _to_json_string(payload_obj)))
@@ -85,14 +90,15 @@ def explode_sqs_event_to_payloads(event: Dict[str, Any]) -> List[Tuple[str, str]
 
 # -------------------------- internals -------------------------- #
 
-def _loads_multipass(value: Any, *, max_passes: int = 4) -> Jsonable:
-    """Robustly decode JSON across multiple escaping layers (\\, \\n, etc.).
+def _loads_multipass(value: Any, *, max_passes: int = 6) -> Jsonable:
+    """Robustly decode JSON across multiple escaping layers (\\\\, \\n, etc.).
 
     Behavior:
       * bytes/bytearray -> UTF-8 string
       * If already dict/list -> returned as-is
-      * While it's a string that looks like JSON, keep json.loads() up to `max_passes`
-      * Handles the common "JSON string of JSON string" pattern from SQS logs
+      * While it's a string that *looks* like JSON, keep json.loads() up to `max_passes`
+      * If json.loads fails due to visible escapes, try a gentle unicode-unescape fallback
+      * Handles the common “JSON string of a JSON string” pattern seen in CloudWatch logs
     """
     cur: Any = value
 
@@ -111,20 +117,30 @@ def _loads_multipass(value: Any, *, max_passes: int = 4) -> Jsonable:
             return cur
 
         s = cur.strip()
-
         try:
             decoded = json.loads(s, strict=False)
         except json.JSONDecodeError:
-            # Sometimes the string is quoted JSON with visible escapes; try gentle unquote.
+            # If the string contains heavy escaping (\\n, \\"), try one gentle unescape.
+            if "\\" in s:
+                try:
+                    s2 = bytes(s, "utf-8").decode("unicode_escape")
+                    decoded = json.loads(s2, strict=False)
+                    cur = decoded
+                    # loop again in case decoded is another JSON string
+                    continue
+                except Exception:
+                    pass
+            # If the whole thing is quoted, try removing one set of quotes.
             if s and s[0] == s[-1] == '"':
                 try:
                     decoded = json.loads(s[1:-1], strict=False)
+                    cur = decoded
+                    continue
                 except Exception:
                     return cur
-            else:
-                return cur
+            return cur
 
-        # If we decoded to a string that still looks like JSON, loop again.
+        # If we decoded to a JSON *string* that itself looks like JSON, loop again.
         if isinstance(decoded, str) and _looks_like_json(decoded):
             cur = decoded
             continue
@@ -135,15 +151,16 @@ def _loads_multipass(value: Any, *, max_passes: int = 4) -> Jsonable:
 
 
 def _flatten_records(records_field: Any) -> Iterator[dict]:
-    """Yield dict items from 'records' which may be a list or a list-of-lists."""
-    if isinstance(records_field, list):
-        for item in records_field:
-            if isinstance(item, list):
-                for inner in item:
-                    if isinstance(inner, dict):
-                        yield inner
-            elif isinstance(item, dict):
-                yield item
+    """Yield dict items from `records`, tolerating list, list-of-lists, or deeper nesting."""
+    # Recursive walk over lists; yield dicts only
+    def _walk(obj: Any) -> Iterator[dict]:
+        if isinstance(obj, dict):
+            yield obj
+        elif isinstance(obj, list):
+            for item in obj:
+                yield from _walk(item)
+
+    yield from _walk(records_field)
 
 
 def _looks_like_json(s: str) -> bool:
@@ -159,9 +176,7 @@ def _to_json_string(obj: Jsonable) -> str:
 
 
 
-
-###############################
-
+################
 
 # test_helpers.py
 import json
@@ -198,31 +213,21 @@ class TestExplodeSQSEvent(unittest.TestCase):
             ]
         }
         out = explode_sqs_event_to_payloads(event)
-        self.assertEqual(
-            out,
-            [("A", '{"id":3}'), ("B", '{"id":3}')],
-        )
+        self.assertEqual(out, [("A", '{"id":3}'), ("B", '{"id":3}')])
 
-    def test_list_of_lists_records_and_escaped_payload_string(self):
-        # Simulate the heavy-escaped payload you see in logs:
+    def test_list_of_lists_records_and_double_escaped_string(self):
+        # Build a container with two equal payloads
         inner_payload = {"meta": {"ref": "x"}, "payload": {"k": "v", "n": 1}}
         container = {"version": "2", "records": [[inner_payload, inner_payload]]}
-        # Encode twice to create visible backslashes/newlines in a log
+        # Encode twice to simulate CloudWatch style escaping (string-of-string)
         once = json.dumps(container)
-        twice = json.dumps(once)  # string of a string
+        twice = json.dumps(once)  # double-encoded string
         event = {"Records": [{"messageId": "X", "body": twice}]}
         out = explode_sqs_event_to_payloads(event)
-        self.assertEqual(
-            out,
-            [("X", '{"k":"v","n":1}'), ("X", '{"k":"v","n":1}')],
-        )
+        self.assertEqual(out, [("X", '{"k":"v","n":1}'), ("X", '{"k":"v","n":1}')])
 
     def test_body_with_direct_payload_field(self):
-        event = {
-            "Records": [
-                {"messageId": "Z", "body": {"payload": {"x": 10}}},
-            ]
-        }
+        event = {"Records": [{"messageId": "Z", "body": {"payload": {"x": 10}}}]}
         self.assertEqual(explode_sqs_event_to_payloads(event), [("Z", '{"x":10}')])
 
     def test_body_dict_without_records_or_payload_treated_as_payload(self):
@@ -237,14 +242,29 @@ class TestExplodeSQSEvent(unittest.TestCase):
     def test_bytes_and_bytearray_inputs(self):
         container = {"records": [{"payload": {"b": 1}}, {"payload": {"b": 2}}]}
         body_bytes = json.dumps(container).encode("utf-8")
+
+        # case 1: body is bytes representing the container
         event = {"Records": [{"messageId": "B1", "body": body_bytes}]}
         out = explode_sqs_event_to_payloads(event)
         self.assertEqual(out, [("B1", '{"b":1}'), ("B1", '{"b":2}')])
 
-        # payload embedded as bytes inside body dict
+        # case 2: body is a dict with payload=bytes(container)
         event2 = {"Records": [{"messageId": "B2", "body": {"payload": body_bytes}}]}
         out2 = explode_sqs_event_to_payloads(event2)
-        self.assertEqual(out2, [("B2", '{"b":1,"b":2}'.replace('"b":1,"b":2"', '"b":1,"b":2"'))])  # sanity
+        self.assertEqual(out2, [("B2", '{"b":1}'), ("B2", '{"b":2}')])
+
+        # case 3: same as case 1 but using bytearray
+        event3 = {"Records": [{"messageId": "B3", "body": bytearray(body_bytes)}]}
+        out3 = explode_sqs_event_to_payloads(event3)
+        self.assertEqual(out3, [("B3", '{"b":1}'), ("B3", '{"b":2}')])
+
+    def test_payload_obj_container_with_records(self):
+        # body is dict -> payload is string that decodes to container->records
+        inner = {"records": [{"payload": {"p": 1}}, {"payload": {"p": 2}}]}
+        payload_str = json.dumps(inner)
+        event = {"Records": [{"messageId": "Y", "body": {"payload": payload_str}}]}
+        out = explode_sqs_event_to_payloads(event)
+        self.assertEqual(out, [("Y", '{"p":1}'), ("Y", '{"p":2}')])
 
     def test_missing_message_id_is_skipped(self):
         event = {"Records": [{"body": {"payload": {"x": 1}}}]}
@@ -258,22 +278,29 @@ class TestExplodeSQSEvent(unittest.TestCase):
         event = {"Records": [{"messageId": "U", "body": 12345}]}
         self.assertEqual(explode_sqs_event_to_payloads(event), [])
 
-    def test_empty_records(self):
+    def test_empty_records_and_no_records_key(self):
         self.assertEqual(explode_sqs_event_to_payloads({"Records": []}), [])
+        self.assertEqual(explode_sqs_event_to_payloads({}), [])
 
-    # ---- internal helpers coverage ----
+    # ---- internal helper coverage ----
 
     def test_loads_multipass_string_of_string(self):
         obj = {"a": 1}
         s1 = json.dumps(obj)
-        s2 = json.dumps(s1)        # string-of-string (double-escaped)
+        s2 = json.dumps(s1)  # double-encoded
         decoded = _loads_multipass(s2)
         self.assertEqual(decoded, obj)
 
     def test_loads_multipass_non_json_string_returns_original(self):
         self.assertEqual(_loads_multipass("not json"), "not json")
 
-    def test_to_json_string_passes_through_compact(self):
+    def test_loads_multipass_gentle_unicode_unescape(self):
+        # Create a string that fails first json.loads but succeeds after unicode-escape
+        raw = '{\\n  \\"a\\": 1\\n}'
+        decoded = _loads_multipass(raw)
+        self.assertEqual(decoded, {"a": 1})
+
+    def test_to_json_string_compact_and_passthrough(self):
         self.assertEqual(_to_json_string({"a": 1, "b": 2}), '{"a":1,"b":2}')
         already = '{"x":3}'
         self.assertEqual(_to_json_string(already), already)
@@ -281,3 +308,4 @@ class TestExplodeSQSEvent(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
