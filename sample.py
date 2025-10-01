@@ -12,7 +12,7 @@ from helpers import (
 
 class TestHelpersFullCoverage(unittest.TestCase):
     # ---------------------------------------------------------------------
-    # explode_sqs_event_to_payloads — primary paths
+    # explode_sqs_event_to_payloads — primary success paths
     # ---------------------------------------------------------------------
 
     def test_records_list_multiple_payloads(self):
@@ -44,13 +44,6 @@ class TestHelpersFullCoverage(unittest.TestCase):
         self.assertEqual(
             explode_sqs_event_to_payloads(event),
             [("deep", '{"z":7}'), ("deep", '{"z":9}')],
-        )
-
-    def test_records_present_but_nonjson_string_fallback_to_whole_body(self):
-        event = {"Records": [{"messageId": "bad", "body": {"version": "1", "records": "not-json"}}]}
-        self.assertEqual(
-            explode_sqs_event_to_payloads(event),
-            [("bad", '{"version":"1","records":"not-json"}')],
         )
 
     def test_payload_field_decodes_to_container_with_records(self):
@@ -88,6 +81,11 @@ class TestHelpersFullCoverage(unittest.TestCase):
         event = {"Records": [{"messageId": "E", "body": raw}]}
         self.assertEqual(explode_sqs_event_to_payloads(event), [("E", '{"t":1}'), ("E", '{"t":2}')])
 
+    def test_body_string_json_list_payload(self):
+        # body is a JSON array -> returned as a single payload JSON string
+        event = {"Records": [{"messageId": "L", "body": '["x", 1]'}]}
+        self.assertEqual(explode_sqs_event_to_payloads(event), [("L", '["x",1]')])
+
     def test_bytes_and_bytearray_bodies(self):
         container = {"records": [{"payload": {"x": 1}}, {"payload": {"x": 2}}]}
         data = json.dumps(container).encode()
@@ -96,29 +94,65 @@ class TestHelpersFullCoverage(unittest.TestCase):
         self.assertEqual(explode_sqs_event_to_payloads(e1), [("B1", '{"x":1}'), ("B1", '{"x":2}')])
         self.assertEqual(explode_sqs_event_to_payloads(e2), [("B2", '{"x":1}'), ("B2", '{"x":2}')])
 
-    def test_missing_messageid_missing_body_and_unrecognized_type(self):
+    # ---------------------------------------------------------------------
+    # explode_sqs_event_to_payloads — guard / fallback paths
+    # ---------------------------------------------------------------------
+
+    def test_records_present_but_nonjson_string_fallback_to_whole_body(self):
+        event = {"Records": [{"messageId": "bad", "body": {"version": "1", "records": "not-json"}}]}
+        self.assertEqual(
+            explode_sqs_event_to_payloads(event),
+            [("bad", '{"version":"1","records":"not-json"}')],
+        )
+
+    def test_body_is_nonjson_string_unrecognized(self):
+        # body is a plain string that does not look like JSON → skipped (no results)
+        event = {"Records": [{"messageId": "U", "body": "hello"}]}
+        self.assertEqual(explode_sqs_event_to_payloads(event), [])
+
+    def test_payload_field_nonjson_string(self):
+        # payload exists but is a non-JSON string → treated as scalar JSON
+        event = {"Records": [{"messageId": "PNJ", "body": {"payload": "abc"}}]}
+        self.assertEqual(explode_sqs_event_to_payloads(event), [("PNJ", '"abc"')])
+
+    def test_records_contains_non_dict_items_are_ignored(self):
+        event = {
+            "Records": [
+                {
+                    "messageId": "M",
+                    "body": {"records": [123, "abc", {"payload": {"ok": 1}}]},
+                }
+            ]
+        }
+        self.assertEqual(explode_sqs_event_to_payloads(event), [("M", '{"ok":1}')])
+
+    def test_missing_messageid_missing_body_body_none_and_unrecognized_type(self):
         e1 = {"Records": [{"body": {"payload": {"a": 1}}}]}  # skip: no messageId
-        e2 = {"Records": [{"messageId": "m1"}]}              # skip: no body
-        e3 = {"Records": [{"messageId": "m2", "body": 12345}]}  # skip: unrecognized type
+        e2 = {"Records": [{"messageId": "m1"}]}              # skip: no body at all
+        e3 = {"Records": [{"messageId": "m2", "body": None}]}  # skip: body is None
+        e4 = {"Records": [{"messageId": "m3", "body": 12345}]}  # skip: unrecognized type
+        e5 = {"Records": None}                                  # Records is None
         self.assertEqual(explode_sqs_event_to_payloads(e1), [])
         self.assertEqual(explode_sqs_event_to_payloads(e2), [])
         self.assertEqual(explode_sqs_event_to_payloads(e3), [])
+        self.assertEqual(explode_sqs_event_to_payloads(e4), [])
+        self.assertEqual(explode_sqs_event_to_payloads(e5), [])
 
     def test_empty_inputs(self):
         self.assertEqual(explode_sqs_event_to_payloads({"Records": []}), [])
         self.assertEqual(explode_sqs_event_to_payloads({}), [])
 
     # ---------------------------------------------------------------------
-    # _loads_multipass — all decoding branches
+    # _loads_multipass — decoding branches incl. failures
     # ---------------------------------------------------------------------
 
     def test_loads_multipass_bytes_dict_string_of_string_and_quoted(self):
         obj = {"a": 1}
-        self.assertEqual(_loads_multipass(obj), obj)                     # already dict
-        self.assertEqual(_loads_multipass(json.dumps(obj).encode()), obj)  # bytes
-        s2 = json.dumps(json.dumps(obj))                                 # string of string
+        self.assertEqual(_loads_multipass(obj), obj)                       # already dict
+        self.assertEqual(_loads_multipass(json.dumps(obj).encode()), obj)  # bytes → str → json
+        s2 = json.dumps(json.dumps(obj))                                   # string-of-string
         self.assertEqual(_loads_multipass(s2), obj)
-        quoted = '"{\\"b\\":2}"'                                         # quoted JSON
+        quoted = '"{\\"b\\":2}"'                                           # quoted JSON
         self.assertEqual(_loads_multipass(quoted), {"b": 2})
 
     def test_loads_multipass_unicode_escape_success(self):
@@ -129,6 +163,11 @@ class TestHelpersFullCoverage(unittest.TestCase):
         # contains \t → becomes a real tab after unicode_escape; still not JSON → returned as transformed string
         s = "text\\tstill-not-json"
         self.assertEqual(_loads_multipass(s), "text\tstill-not-json")
+
+    def test_loads_multipass_quoted_nonjson_remains_original(self):
+        # json.loads fails on inner; no backslashes worth; returns original quoted string
+        s = '"not json"'
+        self.assertEqual(_loads_multipass(s), '"not json"')
 
     def test_loads_multipass_no_progress_returns_original(self):
         self.assertEqual(_loads_multipass("plain text"), "plain text")
