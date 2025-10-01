@@ -38,7 +38,6 @@ def explode_sqs_event_to_payloads(event: Dict[str, Any]) -> List[Tuple[str, str]
     results: List[Tuple[str, str]] = []
 
     for rec in (event.get("Records") or []):
-        # Be defensive around case/shape
         msg_id = rec.get("messageId") or rec.get("messageid")
         if not msg_id:
             logger.debug("Skipping record without messageId: %r", rec)
@@ -51,35 +50,58 @@ def explode_sqs_event_to_payloads(event: Dict[str, Any]) -> List[Tuple[str, str]
 
         body_obj = _loads_multipass(body_raw)
 
-        # Common shape: {"version": "...", "records": [[{ "payload": ... }, ...]]}
+        # 1) Preferred path: top-level 'records'
+        found = False
         if isinstance(body_obj, dict) and "records" in body_obj:
-            for inner in _flatten_records(body_obj["records"]):
+            recs = body_obj["records"]
+            if not isinstance(recs, (list, dict)):
+                recs = _loads_multipass(recs)
+            for inner in _flatten_records(recs):
                 if isinstance(inner, dict) and "payload" in inner:
                     payload_obj = _loads_multipass(inner["payload"])
                     results.append((msg_id, _to_json_string(payload_obj)))
-            continue
+                    found = True
+        if found:
+            continue  # we extracted at least one payload from 'records'
 
-        # If body has a single "payload" but that payload itself decodes to a container
-        # that includes "records", flatten those as well (bytes/escaped-string cases).
+        # 2) Single 'payload' at top-level, which might itself contain 'records'
         if isinstance(body_obj, dict) and "payload" in body_obj:
             payload_obj = _loads_multipass(body_obj["payload"])
             if isinstance(payload_obj, dict) and "records" in payload_obj:
-                for inner in _flatten_records(payload_obj["records"]):
+                recs2 = payload_obj["records"]
+                if not isinstance(recs2, (list, dict)):
+                    recs2 = _loads_multipass(recs2)
+                for inner in _flatten_records(recs2):
                     if isinstance(inner, dict) and "payload" in inner:
                         inner_payload = _loads_multipass(inner["payload"])
                         results.append((msg_id, _to_json_string(inner_payload)))
-            else:
-                results.append((msg_id, _to_json_string(payload_obj)))
+                if results:
+                    continue
+            # Otherwise treat payload as the final message
+            results.append((msg_id, _to_json_string(payload_obj)))
             continue
 
-        # Treat body dict (without records/payload) as the payload itself.
+        # 3) Body is a dict but with no 'records'/'payload' -> treat body as the payload
         if isinstance(body_obj, dict):
             results.append((msg_id, _to_json_string(body_obj)))
             continue
 
-        # Body is a JSON string for the payload container/object.
+        # 4) Body is a JSON-looking string — peel & normalize
         if isinstance(body_obj, str) and _looks_like_json(body_obj):
             payload_obj = _loads_multipass(body_obj)
+            # If after peeling we find 'records', extract multiple payloads
+            if isinstance(payload_obj, dict) and "records" in payload_obj:
+                recs3 = payload_obj["records"]
+                if not isinstance(recs3, (list, dict)):
+                    recs3 = _loads_multipass(recs3)
+                extracted_any = False
+                for inner in _flatten_records(recs3):
+                    if isinstance(inner, dict) and "payload" in inner:
+                        inner_payload = _loads_multipass(inner["payload"])
+                        results.append((msg_id, _to_json_string(inner_payload)))
+                        extracted_any = True
+                if extracted_any:
+                    continue
             results.append((msg_id, _to_json_string(payload_obj)))
             continue
 
@@ -90,15 +112,17 @@ def explode_sqs_event_to_payloads(event: Dict[str, Any]) -> List[Tuple[str, str]
 
 # -------------------------- internals -------------------------- #
 
-def _loads_multipass(value: Any, *, max_passes: int = 6) -> Jsonable:
+def _loads_multipass(value: Any, *, max_passes: int = 8) -> Jsonable:
     """Robustly decode JSON across multiple escaping layers (\\\\, \\n, etc.).
 
-    Behavior:
+    Strategy:
       * bytes/bytearray -> UTF-8 string
-      * If already dict/list -> returned as-is
-      * While it's a string that *looks* like JSON, keep json.loads() up to `max_passes`
-      * If json.loads fails due to visible escapes, try a gentle unicode-unescape fallback
-      * Handles the common “JSON string of a JSON string” pattern seen in CloudWatch logs
+      * While value is a string:
+         1) Try json.loads()
+         2) If that fails and string is quoted, strip ONE outer quote layer and retry
+         3) If that fails and string contains backslashes, apply unicode-escape and retry
+         4) If still not JSON, stop and return the string as-is
+      * Repeat up to `max_passes` to peel double/triple encodings.
     """
     cur: Any = value
 
@@ -117,48 +141,57 @@ def _loads_multipass(value: Any, *, max_passes: int = 6) -> Jsonable:
             return cur
 
         s = cur.strip()
+
+        # Try plain JSON
         try:
             decoded = json.loads(s, strict=False)
+            # If decoded into a JSON string that itself looks like JSON, keep peeling
+            if isinstance(decoded, str) and _looks_like_json(decoded.strip()):
+                cur = decoded
+                continue
+            return decoded
         except json.JSONDecodeError:
-            # If the string contains heavy escaping (\\n, \\"), try one gentle unescape.
-            if "\\" in s:
-                try:
-                    s2 = bytes(s, "utf-8").decode("unicode_escape")
-                    decoded = json.loads(s2, strict=False)
-                    cur = decoded
-                    # loop again in case decoded is another JSON string
-                    continue
-                except Exception:
-                    pass
-            # If the whole thing is quoted, try removing one set of quotes.
-            if s and s[0] == s[-1] == '"':
-                try:
-                    decoded = json.loads(s[1:-1], strict=False)
-                    cur = decoded
-                    continue
-                except Exception:
-                    return cur
+            pass  # proceed to transformations
+
+        transformed = False
+
+        # Strip a single layer of surrounding quotes if present
+        if s and s[0] == s[-1] == '"':
+            s = s[1:-1]
+            transformed = True
+
+        # Attempt unicode escape (handles \\n, \\" showing up literally)
+        if "\\" in s:
+            try:
+                s2 = bytes(s, "utf-8").decode("unicode_escape")
+                s = s2
+                transformed = True
+            except Exception:
+                # If unicode_escape fails, keep the original s
+                pass
+
+        if not transformed:
+            # No progress can be made
             return cur
 
-        # If we decoded to a JSON *string* that itself looks like JSON, loop again.
-        if isinstance(decoded, str) and _looks_like_json(decoded):
-            cur = decoded
-            continue
-
-        return decoded
+        cur = s  # loop again with the transformed candidate
 
     return cur
 
 
 def _flatten_records(records_field: Any) -> Iterator[dict]:
     """Yield dict items from `records`, tolerating list, list-of-lists, or deeper nesting."""
-    # Recursive walk over lists; yield dicts only
     def _walk(obj: Any) -> Iterator[dict]:
         if isinstance(obj, dict):
             yield obj
         elif isinstance(obj, list):
             for item in obj:
                 yield from _walk(item)
+        else:
+            # If 'records' itself is a JSON string, try to peel it once more.
+            if isinstance(obj, str) and _looks_like_json(obj):
+                peeled = _loads_multipass(obj)
+                yield from _walk(peeled)
 
     yield from _walk(records_field)
 
@@ -170,13 +203,16 @@ def _looks_like_json(s: str) -> bool:
 
 def _to_json_string(obj: Jsonable) -> str:
     """Normalize any JSON-able object to a compact JSON string."""
-    if isinstance(obj, str) and _looks_like_json(obj):
+    if isinstance(obj, str) and _looks_like_json(obj.strip()):
         return obj
     return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
 
 
 
-################
+
+##################################################
+
+
 
 # test_helpers.py
 import json
@@ -219,12 +255,26 @@ class TestExplodeSQSEvent(unittest.TestCase):
         # Build a container with two equal payloads
         inner_payload = {"meta": {"ref": "x"}, "payload": {"k": "v", "n": 1}}
         container = {"version": "2", "records": [[inner_payload, inner_payload]]}
-        # Encode twice to simulate CloudWatch style escaping (string-of-string)
+        # Encode twice to simulate CloudWatch style double-escaping (string-of-string)
         once = json.dumps(container)
-        twice = json.dumps(once)  # double-encoded string
+        twice = json.dumps(once)
         event = {"Records": [{"messageId": "X", "body": twice}]}
         out = explode_sqs_event_to_payloads(event)
         self.assertEqual(out, [("X", '{"k":"v","n":1}'), ("X", '{"k":"v","n":1}')])
+
+    def test_records_field_is_string_needing_extra_peel(self):
+        recs = json.dumps([{"payload": {"a": 1}}, {"payload": {"a": 2}}])
+        event = {"Records": [{"messageId": "R", "body": {"records": recs}}]}
+        out = explode_sqs_event_to_payloads(event)
+        self.assertEqual(out, [("R", '{"a":1}'), ("R", '{"a":2}')])
+
+    def test_payload_contains_records_after_peel(self):
+        # body is dict -> payload is string that decodes to container->records
+        inner = {"records": [{"payload": {"p": 1}}, {"payload": {"p": 2}}]}
+        payload_str = json.dumps(inner)
+        event = {"Records": [{"messageId": "Y", "body": {"payload": payload_str}}]}
+        out = explode_sqs_event_to_payloads(event)
+        self.assertEqual(out, [("Y", '{"p":1}'), ("Y", '{"p":2}')])
 
     def test_body_with_direct_payload_field(self):
         event = {"Records": [{"messageId": "Z", "body": {"payload": {"x": 10}}}]}
@@ -258,13 +308,12 @@ class TestExplodeSQSEvent(unittest.TestCase):
         out3 = explode_sqs_event_to_payloads(event3)
         self.assertEqual(out3, [("B3", '{"b":1}'), ("B3", '{"b":2}')])
 
-    def test_payload_obj_container_with_records(self):
-        # body is dict -> payload is string that decodes to container->records
-        inner = {"records": [{"payload": {"p": 1}}, {"payload": {"p": 2}}]}
-        payload_str = json.dumps(inner)
-        event = {"Records": [{"messageId": "Y", "body": {"payload": payload_str}}]}
+    def test_double_escaped_newlines_and_quotes(self):
+        # Simulate CloudWatch-like string that shows \n and \"
+        raw = '{\\n  \\"records\\": [{\\n    \\"payload\\": {\\n      \\"t\\": 1\\n    }\\n  }, {\\n    \\"payload\\": {\\n      \\"t\\": 2\\n    }\\n  }]\\n}'
+        event = {"Records": [{"messageId": "N", "body": raw}]}
         out = explode_sqs_event_to_payloads(event)
-        self.assertEqual(out, [("Y", '{"p":1}'), ("Y", '{"p":2}')])
+        self.assertEqual(out, [("N", '{"t":1}'), ("N", '{"t":2}')])
 
     def test_missing_message_id_is_skipped(self):
         event = {"Records": [{"body": {"payload": {"x": 1}}}]}
@@ -295,7 +344,6 @@ class TestExplodeSQSEvent(unittest.TestCase):
         self.assertEqual(_loads_multipass("not json"), "not json")
 
     def test_loads_multipass_gentle_unicode_unescape(self):
-        # Create a string that fails first json.loads but succeeds after unicode-escape
         raw = '{\\n  \\"a\\": 1\\n}'
         decoded = _loads_multipass(raw)
         self.assertEqual(decoded, {"a": 1})
@@ -308,4 +356,3 @@ class TestExplodeSQSEvent(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
