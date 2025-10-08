@@ -1,5 +1,3 @@
-
-
 import json
 import logging
 from typing import Any, List, Sequence, Tuple
@@ -11,22 +9,47 @@ MsgTuple = Tuple[str, Any]   # (messageId, payload_object)
 InTuple  = Tuple[str, str]   # (messageId, body_json_string)
 
 
+def _load_body(body_str: str, *, msg_id: str):
+    """
+    Parse the outer SQS body JSON with a simple two-pass approach:
+      1) strict parse
+      2) lenient parse (strict=False) to tolerate raw control chars in strings
+    """
+    try:
+        return json.loads(body_str)
+    except json.JSONDecodeError as e1:
+        logger.warning("Record (id=%s): strict JSON parse failed; retrying lenient (%s)", msg_id, e1)
+        return json.loads(body_str, strict=False)
+
+
 def extract_payloads(records: Sequence[InTuple]) -> List[MsgTuple]:
     """
     Extract payload objects from SQS body JSON strings.
 
+    What it does
+    ------------
     For each (messageId, body_json_string):
-      1) Parse body_json_string (outer JSON).
-      2) Expect body["records"] to be a list of objects with a `payload` field.
-      3) `payload` must be a JSON string; parse it into an object.
-      4) Return a flat list of (messageId, payload_object).
+      1) Parse body_json_string (outer JSON) with strict→lenient fallback.
+      2) Expect `body["records"]` to be a list of dicts with a `payload` field.
+      3) `payload` must be a JSON string; parse it. Use strict→lenient fallback and trim whitespace.
+      4) Return a flat list of (messageId, payload_object). Malformed entries are skipped with warnings.
 
-    Returns: [(messageId, payload_object)], skipping malformed entries with warnings.
+    Parameters
+    ----------
+    records : Sequence[Tuple[str, str]]
+        Built in the handler as: [(r["messageId"], r["body"]) for r in event["Records"]].
+
+    Returns
+    -------
+    List[Tuple[str, Any]]
+        [(messageId, payload_object), ...]
     """
     out: List[MsgTuple] = []
     logger.debug("extract_payloads: starting with %d record(s)", len(records))
 
+    # Iterate each SQS item: contract is (messageId, body_json_string)
     for message_id, body_str in records:
+        # Minimal defensive check to avoid surprising crashes
         if not isinstance(message_id, str) or not isinstance(body_str, str):
             logger.warning(
                 "Record (id=%s): expected (str, str), got (%s, %s); skipping",
@@ -34,34 +57,49 @@ def extract_payloads(records: Sequence[InTuple]) -> List[MsgTuple]:
             )
             continue
 
+        # 1) Decode the outer body JSON (strict→lenient)
         try:
-            body = json.loads(body_str)
-        except (TypeError, ValueError) as e:
+            body = _load_body(body_str, msg_id=message_id)
+        except json.JSONDecodeError as e:
             logger.warning("Record (id=%s): body is not valid JSON; skipping (%s)", message_id, e)
             continue
 
-        body_records = body.get("records")
+        # 2) Safely access inner list `records`
+        body_records = body.get("records")  # None if missing
         if not isinstance(body_records, list):
             logger.warning("Record (id=%s): 'records' missing or not a list; skipping", message_id)
             continue
 
         logger.debug("Record (id=%s): found %d inner record(s)", message_id, len(body_records))
 
+        # 3) Pull and decode each 'payload'
         for rec in body_records:
             if not isinstance(rec, dict) or "payload" not in rec:
                 logger.warning("Record (id=%s): missing/invalid 'payload'; skipping", message_id)
                 continue
 
             raw = rec["payload"]
+
+            # Per contract: payload should be a JSON *string* (skip otherwise)
             if not isinstance(raw, str):
                 logger.warning("Record (id=%s): payload is not a string; skipping", message_id)
                 continue
 
+            raw_str = raw.strip()  # whitespace around the JSON is fine
+
+            # Try strict; if it fails, fallback to lenient (tolerates some control chars)
             try:
-                payload = json.loads(raw)
-            except (TypeError, ValueError) as e:
-                logger.warning("Record (id=%s): payload not valid JSON; skipping (%s)", message_id, e)
-                continue
+                payload = json.loads(raw_str)
+            except json.JSONDecodeError as e1:
+                logger.warning("Record (id=%s): strict payload parse failed; retrying lenient (%s)", message_id, e1)
+                try:
+                    payload = json.loads(raw_str, strict=False)
+                except json.JSONDecodeError as e2:
+                    logger.warning(
+                        "Record (id=%s): payload not valid JSON; skipping (%s). Head=%r",
+                        message_id, e2, raw_str[:120],
+                    )
+                    continue
 
             out.append((message_id, payload))
 
@@ -69,76 +107,13 @@ def extract_payloads(records: Sequence[InTuple]) -> List[MsgTuple]:
     return out
 
 
-# ---- Serialization helpers (shared by handler/tests) ----
+# ---- Serialization helpers (used by handler) ----
 
 def to_json_bytes(obj: Any) -> bytes:
-    """
-    Convert an object to compact JSON UTF-8 bytes.
-    - Use for Kinesis `Data=` which requires bytes.
-    """
+    """Compact JSON → UTF-8 bytes (use for Kinesis Data=)."""
     return json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
 def to_json_str(obj: Any) -> str:
-    """
-    Convert an object to a compact JSON string.
-    - Use for SQS MessageBody which requires a string.
-    """
+    """Compact JSON → string (use for SQS MessageBody)."""
     return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
-
-
-
-
-##############################
-
-
-
-import logging
-from utils.helpers import extract_payloads, to_json_bytes, to_json_str
-
-logger = logging.getLogger(__name__)
-
-def lambda_handler(event, context):
-    records = [(r["messageId"], r["body"]) for r in event["Records"]]
-    flattened_payloads = extract_payloads(records)
-
-    # Kinesis: bytes
-    for msg_id, payload in flattened_payloads:
-        kinesis.put_record(
-            StreamARN=kinesis_stream_name,
-            Data=to_json_bytes(payload),
-            PartitionKey=msg_id,
-        )
-
-    # SQS: strings
-    msg_bodies = [to_json_str(payload) for _, payload in flattened_payloads]
-    push_batch_to_sqs_concurrently(sqs, queue_url, msg_bodies)
-
-    return {"ok": True, "count": len(flattened_payloads)}
-
-
-
-#################
-
-
-import json
-import unittest
-from utils.helpers import extract_payloads, to_json_bytes, to_json_str
-
-class TestExtractPayloads(unittest.TestCase):
-    # … existing tests …
-
-    def test_to_json_bytes_and_str(self):
-        # ensures serializers return the correct types and round-trip
-        obj = {"k": 1, "s": "á"}
-        s = to_json_str(obj)
-        b = to_json_bytes(obj)
-        self.assertIsInstance(s, str)
-        self.assertIsInstance(b, (bytes, bytearray))
-        self.assertEqual(json.loads(s), obj)
-        self.assertEqual(json.loads(b.decode("utf-8")), obj)
-
-if __name__ == "__main__":
-    unittest.main()
-
-
