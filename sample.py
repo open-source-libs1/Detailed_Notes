@@ -1,21 +1,35 @@
-
 from pyspark.sql import functions as F
 
-target_tbl = "puma_qa.quality_platform.qa_ce_stage_qp_detail_table"
+# 1) CE - detail
+ce_detail_table = "puma_qa.quality_platform.qa_ce_stage_qp_detail_table"
+tgt = spark.table(ce_detail_table)
+to_write = ce_regression_detail_daily_result.select([F.col(c) for c in tgt.columns])
+to_write.write.mode("append").insertInto(ce_detail_table)
 
-# 1) Make sure the columns and types match the table
-tgt = spark.table(target_tbl)
-tgt_cols = tgt.columns                     # preserves the table's column order
+# 2) CE - summary
+ce_summary_table = "puma_qa.quality_platform.qa_ce_stage_qp_summary_table"
+tgt = spark.table(ce_summary_table)
+to_write = ce_regression_summary_daily_result.select([F.col(c) for c in tgt.columns])
+to_write.write.mode("append").insertInto(ce_summary_table)
 
-# (Optional) quick check
-# display(tgt.limit(1)); ce_regression_detail_daily_result.printSchema(); tgt.printSchema()
+# 3) DFM - detail
+dfm_detail_table = "puma_qa.quality_platform.eos_qp_t_test_run_status"
+tgt = spark.table(dfm_detail_table)
+to_write = dfm_regression_detail_daily_result.select([F.col(c) for c in tgt.columns])
+to_write.write.mode("append").insertInto(dfm_detail_table)
 
-# 2) Re-select/reorder to match the table schema
-to_write = ce_regression_detail_daily_result.select([F.col(c) for c in tgt_cols])
+# 4) DFM - summary
+dfm_summary_table = "puma_qa.quality_platform.eos_qp_t_test_run_dtl_status"
+tgt = spark.table(dfm_summary_table)
+to_write = dfm_regression_summary_daily_result.select([F.col(c) for c in tgt.columns])
+to_write.write.mode("append").insertInto(dfm_summary_table)
 
-# 3) Append to the table
-# Option 1: works for Hive/Parquet/Delta when table already exists and schema matches
-to_write.write.mode("append").insertInto(target_tbl)
 
-# If insertInto is not enabled in your workspace, use:
-# to_write.write.mode("append").saveAsTable(target_tbl)
+for name, df, tbl in [
+    ("CE detail", ce_regression_detail_daily_result, ce_detail_table),
+    ("CE summary", ce_regression_summary_daily_result, ce_summary_table),
+    ("DFM detail", dfm_regression_detail_daily_result, dfm_detail_table),
+    ("DFM summary", dfm_regression_summary_daily_result, dfm_summary_table),
+]:
+    assert df.limit(1).count() > 0, f"{name} DF is empty"
+    assert set(df.columns) >= set(spark.table(tbl).columns), f"{name} DF missing columns for {tbl}"
