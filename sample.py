@@ -1,60 +1,61 @@
-# Databricks notebook source
-# ---------------------------
-# Synchronous Runner (sequential, no result collection)
-# ---------------------------
-import time
-import json
+# --- CONFIG: edit these two paths only ---
+workspace_dir = "/Workspace/Shared/QA Test Automation/Star Rocks Migration/Validate_Table_Output"
+abfss_base   = "abfss://gold@sapbmuscafpdatalakeqa.dfs.core.windows.net/compengine/tmp"
+# ----------------------------------------
 
-TARGET_NOTEBOOK = "/Workspace/Shared/QA Test Automation/Validate_Input_Output_Tables_Final_Sai"
-TIMEOUT_SECS    = 6 * 60 * 60   # per run
-RETRIES         = 1             # additional attempts per input (0 = no retry)
-SLEEP_BETWEEN_S = 3             # pause between runs
+export_results = True
 
-RUN_INPUTS = [
-    {
-        "Compare_Method": "Compare2",
-        "Compared_DB": "StarRocks",
-        "Env": "QA",
-        "Filter_By_Request": "Yes",
-        "Scenario_ID": "2F59464FB5664723B16D1FD2",
-        "Table_Type": "Input",
-        "UW_Req_ID": "EFF46DD7B6384048A58A9786",
-    },
-    # add more dicts...
-]
+if export_results:
+    output_name = f"{table_type}_accuracy_F1A1F763C59542998D7BA67110BE99BA"  # you already set this
+    ts = time_stamp()  # your existing helper
+    base = f"{output_name}{environment}_{ts}"
+    fname = f"{base}.xlsx"
 
-def _to_widget_str(v):
-    if v is None: return ""
-    if isinstance(v, bool): return "true" if v else "false"
-    return str(v)
+    # 1) Write the Excel ONCE to a temp DBFS path
+    tmp_dir  = "dbfs:/tmp"
+    tmp_path = f"{tmp_dir}/{fname}"
+    write_df_multiple_to_excel(tmp_path, reference_table_result_dfs)  # <== note: full path, not folder+name
 
-def _coerce_params(d):  # widgets expect strings
-    return {k: _to_widget_str(v) for k, v in d.items()}
+    # Get size to decide Workspace copy
+    import os
+    size_bytes = os.path.getsize(f"/dbfs/tmp/{fname}")
+    limit = 10 * 1024 * 1024  # 10 MB Workspace export cap
 
-failures = []
+    # 2) Copy to Workspace (only if small enough)
+    try:
+        if size_bytes <= limit:
+            dbutils.fs.mkdirs(workspace_dir)
+            dbutils.fs.cp(tmp_path, f"{workspace_dir}/{fname}", True)
+            print(f"✅ Saved to Workspace: {workspace_dir}/{fname}")
+        else:
+            print(f"⚠️ Skipped Workspace copy ({size_bytes} bytes > 10 MB limit).")
+    except Exception as e:
+        print(f"⚠️ Workspace copy failed: {e}")
 
-for idx, params in enumerate(RUN_INPUTS, 1):
-    p = _coerce_params(params)
-    tag = f"{p.get('Scenario_ID','')}/{p.get('UW_Req_ID','')}/{p.get('Compared_DB','')}/{p.get('Table_Type','')}"
-    attempt = 0
-    while True:
-        attempt += 1
-        print(f"[{idx}/{len(RUN_INPUTS)}] Running {tag} (attempt {attempt}) ...")
+    # 3) Copy to ADLS Gen2 (ABFSS) — always
+    abfss_dir = f"{abfss_base}/{base}"
+    try:
+        dbutils.fs.mkdirs(abfss_dir)
+        dbutils.fs.cp(tmp_path, f"{abfss_dir}/{fname}", True)
+        print(f"✅ Saved to ADLS: {abfss_dir}/{fname}")
+    except Exception as e:
+        print(f"❌ ADLS copy failed: {e}")
+
+    # 4) (Optional but handy) put a download-friendly copy in /FileStore
+    #    This avoids the Workspace 10 MB limit and gives you a URL.
+    try:
+        fs_dir = "dbfs:/FileStore/exports"
+        dbutils.fs.mkdirs(fs_dir)
+        dbutils.fs.cp(tmp_path, f"{fs_dir}/{fname}", True)
+
+        # Build a browser URL automatically
         try:
-            dbutils.notebook.run(TARGET_NOTEBOOK, TIMEOUT_SECS, p)
-            print(f"✅ Done {tag}")
-            break
-        except Exception as e:
-            print(f"❌ Failed {tag}: {e}")
-            if attempt > RETRIES:
-                failures.append({"params": params, "error": repr(e)})
-                break
-            time.sleep(5)  # brief backoff before retry
-    time.sleep(SLEEP_BETWEEN_S)
+            host = dbutils.notebook.entry_point.getDbutils().notebook().getContext().browserHostName().get()
+            print(f"🔗 Download: https://{host}/files/exports/{fname}")
+        except:
+            print(f"🔗 Download (append your host): /files/exports/{fname}")
+    except Exception as e:
+        print(f"⚠️ FileStore copy failed: {e}")
 
-if failures:
-    print(f"Completed with {len(failures)} failure(s). See list below:")
-    for f in failures:
-        print(json.dumps(f, ensure_ascii=False))
 else:
-    print("✅ All runs completed successfully.")
+    print("Skipping export")
