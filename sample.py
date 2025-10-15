@@ -1,35 +1,43 @@
-# you already have df_compare_spark and now
-base_dir = "abfss://gold@sapbmuscafpdatalakeqa.dfs.core.windows.net/compengine/tmp"
+# assumes you already built df_compare_spark and 'now' as in your cell
 
-# ---- keep your Delta write (already in your screenshot)
-temp_path = f"{base_dir}/output_accuracy_F1A1F763C59542998D7BA67110BE99BA_{now}"
+base_dir = "abfss://gold@sapbmuscafpdatalakeqa.dfs.core.windows.net/compengine/tmp/test"
+
+# --- keep your Delta output (already working)
+delta_dir = f"{base_dir}/output_accuracy_F1A1F763C59542998D7BA67110BE99BA_{now}"
 try:
-    dbutils.fs.rm(temp_path, recurse=True)
+    dbutils.fs.rm(delta_dir, recurse=True)
 except:
     pass
-df_compare_spark.write.format("delta").mode("overwrite").save(temp_path)
-print(f"✅ Wrote Delta: {temp_path}")
+df_compare_spark.write.format("delta").mode("overwrite").save(delta_dir)
+print(f"✅ Wrote Delta: {delta_dir}")
 
-# ---- write Excel directly to ABFSS (no DBFS, no SDK)
-excel_base = f"Output_accuracy_{now}"
-tmp_excel_dir = f"{base_dir}/tmp{excel_base}"     # spark-excel writes into a dir
-final_excel = f"{base_dir}/{excel_base}.xlsx"       # we’ll move the produced file here
+# --- write a SINGLE CSV directly to ABFSS (no installs)
+csv_base = f"Output_accuracy_{now}"
+tmp_csv_dir = f"{base_dir}/tmp{csv_base}_csv"   # Spark writes a folder of parts
+final_csv   = f"{base_dir}/{csv_base}.csv"        # we’ll move the single part here
 
-# ensure parent exists
-dbutils.fs.mkdirs(base_dir)
-
-# 1) create exactly one .xlsx by coalescing to 1 partition
+# 1) coalesce to 1 partition so we get exactly one CSV part file
 (df_compare_spark.coalesce(1)
- .write
- .format("com.crealytics.spark.excel")
- .option("header", "true")
- .mode("overwrite")
- .save(tmp_excel_dir))   # this creates a part-0000....xlsx inside tmp_excel_dir
+  .write
+  .option("header", "true")
+  .mode("overwrite")
+  .csv(tmp_csv_dir))
 
-# 2) move the produced .xlsx out of the temp dir to a clean single-file path
-xlsx_part = [f.path for f in dbutils.fs.ls(tmp_excel_dir) if f.path.lower().endswith(".xlsx")][0]
-dbutils.fs.mv(xlsx_part, final_excel, True)
-dbutils.fs.rm(tmp_excel_dir, recurse=True)
+# 2) find the produced part-*.csv and move/rename to a clean single-file path
+csv_part = [f.path for f in dbutils.fs.ls(tmp_csv_dir) if f.path.lower().endswith(".csv")][0]
+dbutils.fs.mv(csv_part, final_csv, True)
+dbutils.fs.rm(tmp_csv_dir, recurse=True)
 
-print(f"✅ Wrote Excel: {final_excel}")
-dbutils.notebook.exit(final_excel)   # or return whatever path you prefer
+print(f"✅ Wrote CSV to ADLS: {final_csv}")
+
+# --- optional: also make an easy browser download copy (bypasses the 10 MB Workspace limit)
+files_dir = "dbfs:/FileStore/exports"
+dbutils.fs.mkdirs(files_dir)
+download_csv = f"{files_dir}/{csv_base}.csv"
+dbutils.fs.cp(final_csv, download_csv, True)
+
+try:
+    host = dbutils.notebook.entry_point.getDbutils().notebook().getContext().browserHostName().get()
+    print(f"🔗 Download URL: https://{host}/files/exports/{csv_base}.csv")
+except:
+    pass
