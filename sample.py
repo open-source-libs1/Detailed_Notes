@@ -1,20 +1,15 @@
 # Databricks notebook source
-# ---------------------------------------
-# Simple Parallel Runner for Validation Notebook
-# ---------------------------------------
+# ---------------------------
+# Synchronous Runner (sequential, no result collection)
+# ---------------------------
+import time
+import json
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-# Path of your existing validation notebook
 TARGET_NOTEBOOK = "/Workspace/Shared/QA Test Automation/Validate_Input_Output_Tables_Final_Sai"
+TIMEOUT_SECS    = 6 * 60 * 60   # per run
+RETRIES         = 1             # additional attempts per input (0 = no retry)
+SLEEP_BETWEEN_S = 3             # pause between runs
 
-# Number of threads to use
-MAX_THREADS = 8
-TIMEOUT_SECS = 6 * 60 * 60   # 6 hours per notebook (optional safeguard)
-
-# ---------------------------------------
-# Define all input sets here
-# ---------------------------------------
 RUN_INPUTS = [
     {
         "Compare_Method": "Compare2",
@@ -25,36 +20,41 @@ RUN_INPUTS = [
         "Table_Type": "Input",
         "UW_Req_ID": "EFF46DD7B6384048A58A9786",
     },
-    # Add more inputs below as needed
-    # {
-    #     "Compare_Method": "Compare1",
-    #     "Compared_DB": "MySQL",
-    #     "Env": "QA",
-    #     "Filter_By_Request": "No",
-    #     "Scenario_ID": "XYZ123",
-    #     "Table_Type": "Output",
-    #     "UW_Req_ID": "REQ456",
-    # },
+    # add more dicts...
 ]
 
-# ---------------------------------------
-# Helper function to execute notebook
-# ---------------------------------------
-def _run_notebook(params):
-    try:
-        dbutils.notebook.run(TARGET_NOTEBOOK, TIMEOUT_SECS, params)
-        print(f"✅ Completed: {params.get('Scenario_ID')} | {params.get('UW_Req_ID')}")
-    except Exception as e:
-        print(f"❌ Failed: {params.get('Scenario_ID')} | {params.get('UW_Req_ID')} | Error: {e}")
+def _to_widget_str(v):
+    if v is None: return ""
+    if isinstance(v, bool): return "true" if v else "false"
+    return str(v)
 
-# ---------------------------------------
-# Parallel Execution
-# ---------------------------------------
-print(f"Executing {len(RUN_INPUTS)} notebooks in parallel (max {MAX_THREADS})...")
+def _coerce_params(d):  # widgets expect strings
+    return {k: _to_widget_str(v) for k, v in d.items()}
 
-with ThreadPoolExecutor(max_workers=min(MAX_THREADS, len(RUN_INPUTS))) as executor:
-    futures = [executor.submit(_run_notebook, params) for params in RUN_INPUTS]
-    for _ in as_completed(futures):
-        pass  # no result collection
+failures = []
 
-print("✅ All notebook executions submitted.")
+for idx, params in enumerate(RUN_INPUTS, 1):
+    p = _coerce_params(params)
+    tag = f"{p.get('Scenario_ID','')}/{p.get('UW_Req_ID','')}/{p.get('Compared_DB','')}/{p.get('Table_Type','')}"
+    attempt = 0
+    while True:
+        attempt += 1
+        print(f"[{idx}/{len(RUN_INPUTS)}] Running {tag} (attempt {attempt}) ...")
+        try:
+            dbutils.notebook.run(TARGET_NOTEBOOK, TIMEOUT_SECS, p)
+            print(f"✅ Done {tag}")
+            break
+        except Exception as e:
+            print(f"❌ Failed {tag}: {e}")
+            if attempt > RETRIES:
+                failures.append({"params": params, "error": repr(e)})
+                break
+            time.sleep(5)  # brief backoff before retry
+    time.sleep(SLEEP_BETWEEN_S)
+
+if failures:
+    print(f"Completed with {len(failures)} failure(s). See list below:")
+    for f in failures:
+        print(json.dumps(f, ensure_ascii=False))
+else:
+    print("✅ All runs completed successfully.")
