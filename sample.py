@@ -1,14 +1,7 @@
-
-
-
-# from your project folder (where Pipfile is)
-export PIPENV_VENV_IN_PROJECT=1
-
-# Option A — simplest (user install)
-python3.12 -m pip install --user pipenv
-export PATH="$HOME/Library/Python/3.12/bin:$PATH"   # make pipenv visible
-
-# (or Option B — pipx, equally good)
-# brew install pipx
-# pipx ensurepath
-# pipx install pipenv
+cd /path/to/your/project/fulfillment \
+&& export PIPENV_VENV_IN_PROJECT=1 \
+&& export PATH="$HOME/.local/bin:$PATH" \
+&& PY312="/opt/homebrew/opt/python@3.12/bin/python3.12" \
+&& ~/.local/bin/pipenv --python "$PY312" \
+&& (~/.local/bin/pipenv sync --dev || ~/.local/bin/pipenv install --dev) \
+&& ~/.local/bin/pipenv run pytest -q --cov=src --cov-report=term-missing
