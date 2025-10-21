@@ -1,88 +1,123 @@
-from __future__ import annotations
-import re
-from typing import List
-from pydantic import BaseModel, Field, ValidationError, field_validator
+import json
+import os
+import sys
+import unittest
+from unittest.mock import patch, AsyncMock
 
-class BadRequest(ValueError):
-    def __init__(self, code: int, message: str):
-        self.code = code
-        super().__init__(message)
+# Make sure the parent directory (that CONTAINS 'src') is on sys.path
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))  # -> lambda/
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
-def map_validation_to_400xx(exc: Exception) -> tuple[int, str]:
-    """
-    Priority:
-      1) BadRequest -> explicit 400xx
-      2) Pydantic missing field -> 40001
-      3) Recognize business messages -> 40003/40004/40005
-      4) Otherwise -> 40002
-    """
-    if isinstance(exc, BadRequest):
-        return exc.code, str(exc)
+from src.main import app, create_referral, health, not_found, _get_json_body  # type: ignore
 
-    if isinstance(exc, ValidationError):
-        errors = exc.errors()
-        for err in errors:
-            etype = (err.get("type") or "").lower()
-            if etype == "missing" or etype.endswith("missing"):
-                loc = ".".join(str(p) for p in err.get("loc", [])) or "field"
-                return (40001, f"Missing required field in request ({loc})")
 
-        for err in errors:
-            msg = (err.get("msg") or "").strip()
-            if "Invalid account key type" in msg:
-                return (40004, "Invalid account key type")
-            if "Invalid referral code format" in msg:
-                return (40003, "Invalid referral code format")
-            if "Invalid referral program code" in msg:
-                return (40005, "Invalid referral program code")
+class FakeEvent:
+    def __init__(self, body: dict | None, headers=None):
+        self.headers = headers or {"host": "api.example.com", "x-forwarded-proto": "https"}
+        self._body = body
 
-        if errors:
-            first = errors[0]
-            loc = ".".join(str(p) for p in first.get("loc", [])) or "field"
-            return (40002, f"Invalid value for field {loc}")
+    @property
+    def json_body(self):
+        if self._body is None:
+            raise ValueError("bad json")
+        return self._body
 
-    return (40002, "Invalid value")
 
-class ReferralReferenceKey(BaseModel):
-    referralReferenceKeyName: str = Field(..., min_length=1, max_length=64)
-    referralReferenceKeyValue: str = Field(..., min_length=1, max_length=128)
+class TestHandler(unittest.IsolatedAsyncioTestCase):
+    def set_event(self, body, headers=None):
+        app._current_event = FakeEvent(body, headers=headers)  # type: ignore
 
-class ReferralCreateRequest(BaseModel):
-    prospectAccountKey: str = Field(..., min_length=1, max_length=64)
-    prospectAccountKeyType: str = Field(..., min_length=1, max_length=64)
-    sorId: str = Field(..., min_length=1, max_length=64)
-    referralReferenceKeys: List[ReferralReferenceKey] = Field(default_factory=list)
-    programCode: str = Field(..., min_length=1, max_length=64)
-    referralCode: str = Field(..., min_length=1, max_length=64)
+    @patch("src.main.create_referral_fulfillment", new_callable=AsyncMock, return_value="123")
+    async def test_201(self, _db):
+        body = {
+            "prospectAccountKey": "123",
+            "prospectAccountKeyType": "CARD_ACCOUNT_ID",
+            "sorId": "S",
+            "referralReferenceKeys": [],
+            "programCode": "PROGRAM_001",
+            "referralCode": "REFERRAL_ABC",
+        }
+        self.set_event(body)
+        res = await create_referral()
+        self.assertEqual(res["statusCode"], 201)
+        payload = json.loads(res["body"])
+        self.assertEqual(payload["referralId"], "123")
+        self.assertIn("/enterprise/referrals/123", res["headers"]["Location"])
 
-    @field_validator("prospectAccountKeyType")
-    @classmethod
-    def _v_account_key_type(cls, v: str) -> str:
-        if v not in {"CARD_ACCOUNT_ID"}:
-            raise BadRequest(40004, "Invalid account key type")
-        return v
+    async def test_400_missing_body(self):
+        app._current_event = FakeEvent(None)  # type: ignore
+        res = await create_referral()
+        self.assertEqual(res["statusCode"], 400)
 
-    @field_validator("referralCode")
-    @classmethod
-    def _v_referral_code(cls, v: str) -> str:
-        if not re.fullmatch(r"[A-Z0-9_]{3,64}", v):
-            raise BadRequest(40003, "Invalid referral code format")
-        return v
+    async def test_400_validation(self):
+        # intentionally invalid/missing
+        self.set_event({"programCode": "BAD SPACE"})
+        res = await create_referral()
+        self.assertEqual(res["statusCode"], 400)
 
-    @field_validator("programCode")
-    @classmethod
-    def _v_program_code(cls, v: str) -> str:
-        if not re.fullmatch(r"[A-Z0-9_]{3,64}", v):
-            raise BadRequest(40005, "Invalid referral program code")
-        return v
+    @patch("src.main.create_referral_fulfillment", new_callable=AsyncMock, side_effect=RuntimeError("db down"))
+    async def test_500_db(self, _db):
+        body = {
+            "prospectAccountKey": "123",
+            "prospectAccountKeyType": "CARD_ACCOUNT_ID",
+            "sorId": "S",
+            "referralReferenceKeys": [],
+            "programCode": "PROGRAM_001",
+            "referralCode": "REFERRAL_ABC",
+        }
+        self.set_event(body)
+        res = await create_referral()
+        self.assertEqual(res["statusCode"], 500)
 
-class ReferralCreateResponse(BaseModel):
-    referralId: str
+    @patch("src.main.create_referral_fulfillment", new_callable=AsyncMock, return_value="123")
+    async def test_201_no_host_header(self, _db):
+        # Cover the branch where host header is missing -> relative Location
+        body = {
+            "prospectAccountKey": "123",
+            "prospectAccountKeyType": "CARD_ACCOUNT_ID",
+            "sorId": "S",
+            "referralReferenceKeys": [],
+            "programCode": "PROGRAM_001",
+            "referralCode": "REFERRAL_ABC",
+        }
+        self.set_event(body, headers={})  # no host/proto
+        res = await create_referral()
+        self.assertEqual(res["statusCode"], 201)
+        self.assertTrue(res["headers"]["Location"].startswith("/enterprise/referrals/"))
 
-class ErrorBody(BaseModel):
-    id: int
-    developerText: str
+    def test_get_json_body_callable_and_errors(self):
+        # Cover _get_json_body() callable form and error paths
 
+        class CallableEvent:
+            def __init__(self, body):
+                self.headers = {}
+                self._body = body
+
+            def json_body(self):  # callable
+                return self._body
+
+        # callable success
+        app._current_event = CallableEvent({"x": 1})  # type: ignore
+        got = _get_json_body()
+        self.assertEqual(got, {"x": 1})
+
+        # error: no event
+        app._current_event = None  # type: ignore
+        with self.assertRaises(Exception):
+            _get_json_body()
+
+
+# ---- simple sync tests for the sync helpers (no patches needed) --------------
+
+def test_health_direct():
+    res = health()
+    assert res["statusCode"] == 200
+
+
+def test_not_found_direct():
+    res = not_found({})
+    assert res["statusCode"] == 404
 
 
 
@@ -90,158 +125,103 @@ class ErrorBody(BaseModel):
 
 
 
-from __future__ import annotations
-import json
-from http import HTTPStatus
-from typing import Any, Dict
-
-from aws_lambda_powertools import Logger
-from aws_lambda_powertools.event_handler import ALBResolver
-from aws_lambda_powertools.utilities.typing import LambdaContext
-
-from .models.model_referral import (
-    ReferralCreateRequest,
-    ReferralCreateResponse,
-    ErrorBody,
-    map_validation_to_400xx,
-)
-from .database.db import create_referral_fulfillment
-
-logger = Logger()
-app = ALBResolver()
-
-@app.get("/referrals/health")
-def health() -> Dict[str, Any]:
-    return {"statusCode": 200, "body": json.dumps({"status": "healthy"})}
-
-def _resp(status: int, body: Dict[str, Any], headers: Dict[str, str] | None = None) -> Dict[str, Any]:
-    return {
-        "statusCode": status,
-        "headers": {"Content-Type": "application/json", **(headers or {})},
-        "body": json.dumps(body),
-    }
-
-def _get_json_body() -> Dict[str, Any]:
-    """
-    Work with both runtime and tests:
-      - prefer app.current_event; fallback to app._current_event
-      - support property or callable .json_body
-    """
-    ev = getattr(app, "current_event", None) or getattr(app, "_current_event", None)
-    if ev is None:
-        raise ValueError("no event")
-    jb = getattr(ev, "json_body", None)
-    if jb is None:
-        raise ValueError("missing body")
-    return jb() if callable(jb) else (jb or {})
-
-@app.post("/enterprise/referrals")
-async def create_referral() -> Dict[str, Any]:
-    # 1) body
-    try:
-        body = _get_json_body()
-    except Exception:
-        return _resp(
-            HTTPStatus.BAD_REQUEST,
-            ErrorBody(id=40001, developerText="Missing required field in request (body)").model_dump()
-        )
-
-    # 2) validate (pydantic v2)
-    try:
-        req = ReferralCreateRequest.model_validate(body)
-    except Exception as e:
-        code, message = map_validation_to_400xx(e)
-        return _resp(HTTPStatus.BAD_REQUEST, ErrorBody(id=code, developerText=message).model_dump())
-
-    # 3) db
-    try:
-        rid = await create_referral_fulfillment(req.model_dump())
-    except Exception:
-        logger.exception("db failure")
-        return _resp(HTTPStatus.INTERNAL_SERVER_ERROR, ErrorBody(id=50000, developerText="Internal Server Error").model_dump())
-
-    # 4) created
-    host = getattr(getattr(app, "current_event", None) or getattr(app, "_current_event", None), "headers", {}) or {}
-    proto = host.get("x-forwarded-proto", "https")
-    domain = host.get("host", "")
-    location = f"{proto}://{domain}/enterprise/referrals/{rid}" if domain else f"/enterprise/referrals/{rid}"
-    return _resp(HTTPStatus.CREATED, ReferralCreateResponse(referralId=rid).model_dump(), headers={"Location": location})
-
-@app.not_found
-def not_found(event) -> Dict[str, Any]:
-    return _resp(HTTPStatus.NOT_FOUND, {"error": "Endpoint does not exist"})
-
-@logger.inject_lambda_context(log_event=True)
-async def lambda_handler(event: Dict[str, Any], context: LambdaContext):
-    return await app.resolve(event, context)
-
-
-
-
-#######################################
-
-
-
 import os
 import unittest
-from unittest.mock import patch
-from src.utils.database_utils import get_db_params
+from unittest.mock import patch, AsyncMock, MagicMock, call
 
-BASE = {
+from src.database.db import create_referral_fulfillment, create_connection
+import src.database.db as dbmod
+
+
+@patch.dict(os.environ, {
     "DB_USERNAME": "u",
     "DB_PASSWORD": "p",
     "DB_NAME": "n",
     "DB_HOST": "h",
     "DB_PORT": "5432",
-}
+    "DB_POOL_MIN": "2",
+    "DB_POOL_MAX": "4",
+}, clear=True)
+class TestDBPoolInit(unittest.IsolatedAsyncioTestCase):
+    async def test_pool_init_and_connection_ctx(self):
+        # Reset module-level pool to cover init path
+        dbmod._POOL = None
 
-class TestDBUtils(unittest.TestCase):
-    @patch.dict(os.environ, BASE, clear=True)
-    def test_ok(self):
-        self.assertEqual(get_db_params(), ("n","u","p","h","5432"))
+        created = {}
 
-    @patch.dict(os.environ, {k:v for k,v in BASE.items() if k!="DB_USERNAME"}, clear=True)
-    def test_missing_user(self):
-        with self.assertRaises(RuntimeError) as ctx:
-            get_db_params()
-        self.assertIn("db_user", str(ctx.exception))
+        class DummyConnCtx:
+            async def __aenter__(self): return "CONN"
+            async def __aexit__(self, exc_type, exc, tb): return False
 
-    @patch.dict(os.environ, {k:v for k,v in BASE.items() if k!="DB_PASSWORD"}, clear=True)
-    def test_missing_pw(self):
-        with self.assertRaises(RuntimeError) as ctx:
-            get_db_params()
-        self.assertIn("db_password", str(ctx.exception))
+        class DummyPool:
+            def __init__(self, *, conninfo=None, min_size=None, max_size=None, kwargs=None, **_):
+                created["conninfo"] = conninfo
+                created["min"] = min_size
+                created["max"] = max_size
+                created["kwargs"] = kwargs
 
-    @patch.dict(os.environ, {k:v for k,v in BASE.items() if k!="DB_NAME"}, clear=True)
-    def test_missing_name(self):
-        with self.assertRaises(RuntimeError) as ctx:
-            get_db_params()
-        self.assertIn("db_name", str(ctx.exception))
+            def connection(self):
+                return DummyConnCtx()
 
-    @patch.dict(os.environ, {k:v for k,v in BASE.items() if k!="DB_HOST"}, clear=True)
-    def test_missing_host(self):
-        with self.assertRaises(RuntimeError) as ctx:
-            get_db_params()
-        self.assertIn("db_host", str(ctx.exception))
+        with patch("src.database.db.AsyncConnectionPool", side_effect=lambda *a, **k: DummyPool(**k)):
+            cm = create_connection()  # returns async context manager
+            async with cm as conn:
+                self.assertEqual(conn, "CONN")
 
-    @patch.dict(os.environ, {k:v for k,v in BASE.items() if k!="DB_PORT"}, clear=True)
-    def test_missing_port(self):
-        with self.assertRaises(RuntimeError) as ctx:
-            get_db_params()
-        self.assertIn("db_port", str(ctx.exception))
+        # Assert pool sizes picked up from env and conninfo built
+        self.assertIn("dbname=n", created["conninfo"])
+        self.assertEqual(created["min"], 2)
+        self.assertEqual(created["max"], 4)
+        self.assertIn("application_name", created["kwargs"] or {})
 
 
+@patch.dict(os.environ, {
+    "DB_USERNAME": "u",
+    "DB_PASSWORD": "p",
+    "DB_NAME": "n",
+    "DB_HOST": "h",
+    "DB_PORT": "5432",
+}, clear=True)
+class TestDBBackoff(unittest.IsolatedAsyncioTestCase):
+    @patch("src.database.db.time.sleep", return_value=None)
+    @patch("src.database.db.create_connection")
+    async def test_backoff_calls(self, create_conn_mock, _sleep):
+        # Fail first two attempts, succeed on third; assert backoff timings
+        conn = MagicMock(name="conn")
+        cur = MagicMock(name="cursor")
 
+        async def aenter_cur(): return cur
+        async def aexit_cur(_t, _e, _tb): return False
 
-#########################################
+        curctx = type("CurCtx", (), {"__aenter__": staticmethod(aenter_cur), "__aexit__": staticmethod(aexit_cur)})()
+        conn.cursor.return_value = curctx
 
+        async def aenter_conn(): return conn
+        async def aexit_conn(_t, _e, _tb): return False
+        create_conn_mock.return_value = type("ConnCtx", (), {"__aenter__": staticmethod(aenter_conn), "__aexit__": staticmethod(aexit_conn)})()
 
-from src.main import health, not_found
+        calls = {"n": 0}
 
-async def test_health_direct():
-    res = health()
-    assert res["statusCode"] == 200
+        async def exec_side_effect(*_a, **_k):
+            # raise on first two attempts
+            if calls["n"] < 2:
+                calls["n"] += 1
+                raise RuntimeError("blip")
+            return None
 
-async def test_not_found_direct():
-    res = not_found({})
-    assert res["statusCode"] == 404
+        row_vals = iter([["RID-3"]])
+        cur.execute = AsyncMock(side_effect=exec_side_effect)
+        cur.fetchone = AsyncMock(side_effect=lambda: next(row_vals))
+
+        rid = await create_referral_fulfillment({
+            "prospectAccountKey": "123",
+            "prospectAccountKeyType": "CARD_ACCOUNT_ID",
+            "sorId": "S",
+            "programCode": "PROGRAM_001",
+            "referralCode": "REFERRAL_ABC",
+            "referralReferenceKeys": [],
+        }, retries=3)
+
+        self.assertEqual(rid, "RID-3")
+        # Verify backoff calls: 0.2 (after attempt 1), 0.4 (after attempt 2)
+        self.assertEqual(_sleep.call_args_list, [call(0.2), call(0.4)])
