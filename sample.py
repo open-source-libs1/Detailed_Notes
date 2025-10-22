@@ -1,58 +1,30 @@
-import unittest
-from unittest.mock import patch, MagicMock
-import os
-import ast
-from src.utils import database_utils
+from pyspark.sql.functions import col, when
 
+condition_col = "Final_Network"
+condition_exp = None
 
-class TestFetchDBParamsFromSecret(unittest.TestCase):
-    """Unit tests for fetch_db_params_from_secret()"""
+# ✅ Spark Connect-safe check for non-empty DataFrame
+if All_Revenue_Combined_NPGs_DF.limit(1).count() > 0:
+    for condition_val, cat_name in final_network_conditions:
+        if condition_exp is None:
+            condition_exp = when(condition_val, cat_name)
+        else:
+            condition_exp = condition_exp.when(condition_val, cat_name)
 
-    @patch.dict(os.environ, {"DB_SECRET_ARN": "arn:aws:secretsmanager:us-east-1:123456789012:secret:test"})
-    @patch("src.utils.database_utils.retrieve_secret_value")
-    @patch("src.utils.database_utils.boto3.client")
-    def test_fetch_db_params_success(self, mock_boto_client, mock_retrieve_secret_value):
-        """✅ Should return DB params tuple when secret retrieval succeeds"""
-        mock_boto_client.return_value = MagicMock()
-        fake_secret = {
-            "dbname": "test_db",
-            "username": "admin",
-            "password": "pass123",
-            "host": "localhost",
-            "port": "5432"
-        }
-        mock_retrieve_secret_value.return_value = str(fake_secret)
+    All_Revenue_Combined_NPGs_DF = All_Revenue_Combined_NPGs_DF.withColumn(
+        condition_col, condition_exp.otherwise("NA")
+    )
 
-        result = database_utils.fetch_db_params_from_secret()
+else:
+    print("⚠️ No records present for the Scenario ID")
+    decimal_columns_to_cast = [
+        "NumClaims", "AWP_Total", "Acquisition_Cost",
+        "Cogs_Trad_PBM_Total", "Cogs_Trans_PBM_Total",
+        "Cogs_Dispns_Fee_Trans_PBM_Total", "Cogs_Trad_Medi_Total",
+        "Cogs_Trans_Medi_Total", "Cogs_Dispns_Fee_Trad_Medi_Total"
+    ]
 
-        expected = (
-            fake_secret["dbname"],
-            fake_secret["username"],
-            fake_secret["password"],
-            fake_secret["host"],
-            fake_secret["port"],
+    for clm in decimal_columns_to_cast:
+        All_Revenue_Combined_NPGs_DF = All_Revenue_Combined_NPGs_DF.withColumn(
+            clm, col(clm).cast("double")
         )
-        self.assertEqual(result, expected)
-        mock_boto_client.assert_called_once_with("secretsmanager")
-        mock_retrieve_secret_value.assert_called_once()
-
-    @patch.dict(os.environ, {"DB_SECRET_ARN": "arn:aws:secretsmanager:us-east-1:123456789012:secret:test"})
-    @patch("src.utils.database_utils.retrieve_secret_value", return_value="")
-    @patch("src.utils.database_utils.boto3.client")
-    def test_fetch_db_params_failure_empty_secret(self, mock_boto_client, mock_retrieve_secret_value):
-        """❌ Should raise ValueError when secret retrieval fails"""
-        mock_boto_client.return_value = MagicMock()
-
-        with self.assertRaises(ValueError) as ctx:
-            database_utils.fetch_db_params_from_secret()
-        self.assertIn("Failed to retrieve secret", str(ctx.exception))
-
-    @patch.dict(os.environ, {}, clear=True)
-    def test_missing_env_variable(self):
-        """❌ Should raise KeyError when DB_SECRET_ARN is missing"""
-        with self.assertRaises(KeyError):
-            database_utils.fetch_db_params_from_secret()
-
-
-if __name__ == "__main__":
-    unittest.main()
