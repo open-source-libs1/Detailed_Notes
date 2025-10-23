@@ -1,15 +1,31 @@
-import pandas as pd
-import os
+from pyspark.sql.functions import when, col
 
-output_name = f"Revenue_detail_"
-file_path = f"/Workspace/Shared/QA Test Automation/Star Rocks Migration/Validate_Table_Output/Latest-Sai/OCT-23/others/{output_name}{uw_req_id}_{time_stamp()}.xlsx"
+# Update logic for CE Summary table
+ce_regression_summary_daily_result = (
+    ce_regression_summary_daily_result
+    .withColumn(
+        "EXECUTION_STATUS",
+        when(col("SUCCESS_CNT") > 0, "COMPLETED").otherwise(col("EXECUTION_STATUS"))
+    )
+    .withColumn(
+        "TS_STATUS",
+        when(col("SUCCESS_CNT") > 0, "PASS").otherwise(col("TS_STATUS"))
+    )
+    .withColumn(
+        "FAILURE_CNT",
+        when(col("SUCCESS_CNT") > 0, 0).otherwise(col("FAILURE_CNT"))
+    )
+    .withColumn(
+        "TOTAL_CNT",
+        when(col("SUCCESS_CNT") > 0, col("SUCCESS_CNT")).otherwise(col("TOTAL_CNT"))
+    )
+)
 
-# Ensure directory exists
-os.makedirs(os.path.dirname(file_path), exist_ok=True)
+# Then continue as before
+ce_regression_summary_daily_result = ce_regression_summary_daily_result.select(
+    "RUN_ID", "TQ_CD", "TS_CTG", "PARENT_REQUEST_ID", "REQUEST_ID",
+    "TASK_ID", "EXECUTION_STATUS", "TS_STATUS", "TOTAL_CNT",
+    "SUCCESS_CNT", "FAILURE_CNT", "RUN_DATE_TS", "RUN_USER"
+)
 
-# Write all data into one single Excel sheet
-with pd.ExcelWriter(file_path, engine="xlsxwriter") as writer:
-    result_df.to_excel(writer, index=False, sheet_name="Results")
-
-print(f"✅ Exported all results to one sheet: {file_path}")
-
+display(ce_regression_summary_daily_result)
