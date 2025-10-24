@@ -29,32 +29,13 @@ async def get_connection_pool(
     db_port: str,
     min_connections: int = 1,
     max_connections: int = 5,
-):
+) -> AsyncConnectionPool:
     """
     Initialize and return a global AsyncConnectionPool using psycopg3.
-
-    The pool is created once and reused (e.g., across AWS Lambda warm invocations).
-
-    Args:
-        db_name: Database name.
-        db_user: Username.
-        db_password: Password.
-        db_host: Database hostname or IP.
-        db_port: Database port.
-        min_connections: Minimum connections to maintain in pool.
-        max_connections: Maximum connections allowed in pool.
-
-    Returns:
-        AsyncConnectionPool instance.
-
-    Raises:
-        ValueError: If pool size parameters are invalid.
-        OperationalError: If connection initialization fails.
     """
-    global _POOL
+    global _POOL  # type: ignore[attr-defined]
 
     if _POOL is None:
-        # --- Safety rules ---
         if min_connections < 1:
             raise ValueError("min_connections must be >= 1")
 
@@ -71,7 +52,6 @@ async def get_connection_pool(
                 max_size=max_connections,
                 open=False,
             )
-
             await _POOL.open(wait=True)
             logger.info(
                 "✅ DB async pool initialized (min=%s, max=%s) for host %s",
@@ -86,9 +66,9 @@ async def get_connection_pool(
     return _POOL
 
 
-async def close_connection_pool():
+async def close_connection_pool() -> None:
     """Gracefully close the global async connection pool (if exists)."""
-    global _POOL
+    global _POOL  # type: ignore[attr-defined]
     if _POOL:
         await _POOL.close()
         _POOL = None
@@ -98,23 +78,20 @@ async def close_connection_pool():
 
 
 
-
-###############
-
-
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
 
 
 import unittest
 from unittest.mock import patch, AsyncMock
 from psycopg import OperationalError
+from psycopg_pool import AsyncConnectionPool
 from db_util import connection_pool
 
 
 class TestConnectionPool(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
-        # Reset global pool before each test
-        connection_pool._POOL = None
-        self.db_args = {
+    async def asyncSetUp(self) -> None:
+        connection_pool._POOL = None  # type: ignore[attr-defined]
+        self.db_args: dict[str, str] = {
             "db_name": "test_db",
             "db_user": "test_user",
             "db_password": "test_pass",
@@ -123,14 +100,12 @@ class TestConnectionPool(unittest.IsolatedAsyncioTestCase):
         }
 
     @patch("db_util.connection_pool.AsyncConnectionPool")
-    async def test_create_pool_success(self, mock_pool):
-        mock_instance = AsyncMock()
+    async def test_create_pool_success(self, mock_pool: AsyncMock) -> None:
+        mock_instance = AsyncMock(spec=AsyncConnectionPool)
         mock_pool.return_value = mock_instance
 
         pool = await connection_pool.get_connection_pool(
-            **self.db_args,
-            min_connections=1,
-            max_connections=5,
+            **self.db_args, min_connections=1, max_connections=5
         )
 
         self.assertEqual(pool, mock_instance)
@@ -138,65 +113,56 @@ class TestConnectionPool(unittest.IsolatedAsyncioTestCase):
         mock_instance.open.assert_awaited_once()
 
     @patch("db_util.connection_pool.AsyncConnectionPool")
-    async def test_reuse_existing_pool(self, mock_pool):
-        mock_instance = AsyncMock()
-        connection_pool._POOL = mock_instance  # already initialized
+    async def test_reuse_existing_pool(self, mock_pool: AsyncMock) -> None:
+        mock_instance = AsyncMock(spec=AsyncConnectionPool)
+        connection_pool._POOL = mock_instance  # type: ignore[attr-defined]
 
         pool = await connection_pool.get_connection_pool(
-            **self.db_args,
-            min_connections=2,
-            max_connections=6,
+            **self.db_args, min_connections=2, max_connections=6
         )
 
-        # Should reuse existing pool, not create new one
         mock_pool.assert_not_called()
         self.assertEqual(pool, mock_instance)
 
     @patch("db_util.connection_pool.AsyncConnectionPool")
-    async def test_invalid_min_connections(self, mock_pool):
+    async def test_invalid_min_connections(self, mock_pool: AsyncMock) -> None:
         with self.assertRaises(ValueError):
             await connection_pool.get_connection_pool(
-                **self.db_args,
-                min_connections=0,
-                max_connections=5,
+                **self.db_args, min_connections=0, max_connections=5
             )
 
     @patch("db_util.connection_pool.AsyncConnectionPool")
-    async def test_invalid_min_greater_equal_max(self, mock_pool):
+    async def test_invalid_min_greater_equal_max(self, mock_pool: AsyncMock) -> None:
         with self.assertRaises(ValueError):
             await connection_pool.get_connection_pool(
-                **self.db_args,
-                min_connections=5,
-                max_connections=5,
+                **self.db_args, min_connections=5, max_connections=5
             )
 
     @patch("db_util.connection_pool.AsyncConnectionPool")
-    async def test_invalid_max_connections_too_large(self, mock_pool):
+    async def test_invalid_max_connections_too_large(self, mock_pool: AsyncMock) -> None:
         with self.assertRaises(ValueError):
             await connection_pool.get_connection_pool(
-                **self.db_args,
-                min_connections=1,
-                max_connections=11,
+                **self.db_args, min_connections=1, max_connections=11
             )
 
     @patch("db_util.connection_pool.AsyncConnectionPool")
-    async def test_create_pool_failure(self, mock_pool):
+    async def test_create_pool_failure(self, mock_pool: AsyncMock) -> None:
         mock_pool.side_effect = OperationalError("mock failure")
+
         with self.assertRaises(OperationalError):
             await connection_pool.get_connection_pool(
-                **self.db_args,
-                min_connections=1,
-                max_connections=5,
+                **self.db_args, min_connections=1, max_connections=5
             )
 
     @patch("db_util.connection_pool.AsyncConnectionPool")
-    async def test_close_pool(self, mock_pool):
-        mock_instance = AsyncMock()
-        connection_pool._POOL = mock_instance
+    async def test_close_pool(self, mock_pool: AsyncMock) -> None:
+        mock_instance = AsyncMock(spec=AsyncConnectionPool)
+        connection_pool._POOL = mock_instance  # type: ignore[attr-defined]
 
         await connection_pool.close_connection_pool()
 
         mock_instance.close.assert_awaited_once()
         self.assertIsNone(connection_pool._POOL)
+
 
 
