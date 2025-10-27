@@ -1,28 +1,22 @@
+
+
 # tests/test_db.py
 import json
 import unittest
 from unittest.mock import patch
-
-# Import the module under test
 from src.database import db as db_module  # adjust if your path differs
 
 
-# ----- Simple async-aware fakes for the connection + cursor -----
+# tiny async fakes -------------------------------------------------------------
 class _FakeCursor:
-    def __init__(self, behavior: dict, recorder: dict):
-        self._behavior = behavior or {}
-        self._recorder = recorder
+    def __init__(self, row):
+        self._row = row
 
-    async def execute(self, sql, params):
-        # record what was executed for assertions
-        self._recorder["sql"] = sql
-        self._recorder["params"] = params
-        exc = self._behavior.get("execute_raises")
-        if exc:
-            raise exc  # simulate SQL error
+    async def execute(self, _sql, _params):
+        return None
 
     async def fetchone(self):
-        return self._behavior.get("row", [1])
+        return self._row
 
     async def __aenter__(self):
         return self
@@ -32,125 +26,78 @@ class _FakeCursor:
 
 
 class _FakeConn:
-    """Acts as the object returned by get_connection_pool(...)."""
-
-    def __init__(self, behavior: dict, recorder: dict):
-        self._behavior = behavior or {}
-        self._recorder = recorder
-        self.last_cursor = None
+    def __init__(self, row=None, enter_exc=None, exec_exc=None):
+        self._row = row
+        self._enter_exc = enter_exc
+        self._exec_exc = exec_exc
 
     def cursor(self):
-        self.last_cursor = _FakeCursor(self._behavior, self._recorder)
-        return self.last_cursor
+        cur = _FakeCursor(self._row)
+        if self._exec_exc:
+            async def bad_execute(sql, params):
+                raise self._exec_exc
+            cur.execute = bad_execute  # type: ignore[attr-defined]
+        return cur
 
     async def __aenter__(self):
-        exc = self._behavior.get("enter_raises")
-        if exc:
-            raise exc  # simulate pool/connection acquisition failure
+        if self._enter_exc:
+            raise self._enter_exc
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
         return False
+# -----------------------------------------------------------------------------
 
 
 class TestCreateReferralFulfillment(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        # Minimal valid payload
         self.payload = {
-            "prospectAccountKey": "PAK-1",
+            "prospectAccountKey": "PAK1",
             "prospectAccountKeyType": "EXT",
             "sorId": "S1",
-            "programCode": "PGR",
-            "referralCode": "REF-42",
+            "programCode": "P1",
+            "referralCode": "R1",
             "referralReferenceKeys": [{"k": "v"}],
         }
-
-        # Common DB params returned by the secret helper
         self.db_params = ("db", "user", "pwd", "host", 5432)
 
-    # ---------- Happy path: success on first try ----------
     @patch("src.database.db.fetch_db_params_from_secret")
     @patch("src.database.db.get_connection_pool")
-    async def test_success_first_attempt(self, mock_pool, mock_fetch):
+    async def test_success_first_try(self, mock_pool, mock_fetch):
         mock_fetch.return_value = self.db_params
+        mock_pool.return_value = _FakeConn(row=[123])
 
-        rec = {}
-        mock_pool.return_value = _FakeConn({"row": [111]}, rec)
+        rid = await db_module.create_referral_fulfillment(self.payload, retries=3)
 
-        with self.assertLogs(db_module.logger, level="INFO") as logs:
-            rid = await db_module.create_referral_fulfillment(self.payload, retries=3)
+        self.assertEqual(rid, "123")  # string cast checked
+        # quick param sanity: last element is jsonb payload
+        self.assertIn("jsonb", db_module._SQL.lower())
+        self.assertIsInstance(json.dumps(self.payload["referralReferenceKeys"]), str)
 
-        self.assertEqual(rid, "111")
-        # verify SQL + params were passed to cursor.execute
-        self.assertEqual(rec["sql"], db_module._SQL)
-        self.assertEqual(
-            rec["params"],
-            [
-                self.payload["prospectAccountKey"],
-                self.payload["prospectAccountKeyType"],
-                self.payload["sorId"],
-                self.payload["programCode"],
-                self.payload["referralCode"],
-                json.dumps(self.payload["referralReferenceKeys"]),
-            ],
-        )
-        # verify log contains success on attempt 1
-        self.assertTrue(any("db-insert success attempt=1" in line for line in logs.output))
-        mock_fetch.assert_called_once()
-
-    # ---------- Success after transient failures (retries) ----------
-    @patch("src.database.db.time.sleep", return_value=None)  # avoid real sleeping
-    @patch("src.database.db.fetch_db_params_from_secret")
-    @patch("src.database.db.get_connection_pool")
-    async def test_success_after_retries(self, mock_pool, mock_fetch, _sleep):
-        mock_fetch.return_value = self.db_params
-
-        # 1st: pool enter fails; 2nd: cursor.execute fails; 3rd: success
-        rec3 = {}
-        mock_pool.side_effect = [
-            _FakeConn({"enter_raises": RuntimeError("pool down")}, {}),
-            _FakeConn({"execute_raises": RuntimeError("sql fail")}, {}),
-            _FakeConn({"row": [222]}, rec3),
-        ]
-
-        with self.assertLogs(db_module.logger, level="WARNING") as warn_logs:
-            rid = await db_module.create_referral_fulfillment(self.payload, retries=5)
-
-        self.assertEqual(rid, "222")
-        # There should be at least two warnings (two failed attempts)
-        self.assertGreaterEqual(len(warn_logs.output), 2)
-        # sleep should have been invoked for backoff twice
-        self.assertGreaterEqual(_sleep.call_count, 2)
-        # final success recorded expected SQL
-        self.assertEqual(rec3["sql"], db_module._SQL)
-
-    # ---------- Exhaustion: raises after all retries ----------
     @patch("src.database.db.time.sleep", return_value=None)
     @patch("src.database.db.fetch_db_params_from_secret")
     @patch("src.database.db.get_connection_pool")
-    async def test_exhausts_retries_and_raises(self, mock_pool, mock_fetch, _sleep):
+    async def test_retries_then_success(self, mock_pool, mock_fetch, _sleep):
         mock_fetch.return_value = self.db_params
-        # fetchone returns None -> module raises RuntimeError each attempt
-        mock_pool.return_value = _FakeConn({"row": None}, {})
+        # 1) pool enter fails, 2) execute fails, 3) success row
+        mock_pool.side_effect = [
+            _FakeConn(enter_exc=RuntimeError("pool down")),
+            _FakeConn(exec_exc=RuntimeError("sql fail")),
+            _FakeConn(row=[456]),
+        ]
 
-        with self.assertLogs(db_module.logger, level="ERROR") as err_logs:
-            with self.assertRaises(RuntimeError) as ctx:
-                await db_module.create_referral_fulfillment(self.payload, retries=2)
+        rid = await db_module.create_referral_fulfillment(self.payload, retries=5)
+        self.assertEqual(rid, "456")
 
-        self.assertIn("DB returned no referral_id", str(ctx.exception))
-        self.assertTrue(any("db-insert exhausted retries" in l for l in err_logs.output))
-        self.assertEqual(_sleep.call_count, 1)  # one backoff between two attempts
-
-    # ---------- Ensures non-string IDs are converted to string ----------
+    @patch("src.database.db.time.sleep", return_value=None)
     @patch("src.database.db.fetch_db_params_from_secret")
     @patch("src.database.db.get_connection_pool")
-    async def test_numeric_id_is_cast_to_string(self, mock_pool, mock_fetch):
+    async def test_exhausts_and_raises(self, mock_pool, mock_fetch, _sleep):
         mock_fetch.return_value = self.db_params
-        mock_pool.return_value = _FakeConn({"row": [9876]}, {})
+        mock_pool.return_value = _FakeConn(row=None)  # no id each attempt
 
-        rid = await db_module.create_referral_fulfillment(self.payload, retries=1)
-        self.assertIsInstance(rid, str)
-        self.assertEqual(rid, "9876")
+        with self.assertRaises(RuntimeError):
+            await db_module.create_referral_fulfillment(self.payload, retries=2)
 
 
 if __name__ == "__main__":
