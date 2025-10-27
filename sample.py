@@ -1,69 +1,157 @@
+# tests/test_db.py
+import json
 import unittest
-from unittest.mock import patch, AsyncMock
-from psycopg import OperationalError
-from psycopg_pool import AsyncConnectionPool
-from db_util.connection_pool import get_connection_pool, close_connection_pool
+from unittest.mock import patch
+
+# Import the module under test
+from src.database import db as db_module  # adjust if your path differs
 
 
-class TestConnectionPool(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self) -> None:
-        from db_util import connection_pool
-        connection_pool._POOL = None  # type: ignore[attr-defined]
-        self.db_args: dict[str, str] = {
-            "db_name": "test_db",
-            "db_user": "test_user",
-            "db_password": "test_pass",
-            "db_host": "localhost",
-            "db_port": "5432",
+# ----- Simple async-aware fakes for the connection + cursor -----
+class _FakeCursor:
+    def __init__(self, behavior: dict, recorder: dict):
+        self._behavior = behavior or {}
+        self._recorder = recorder
+
+    async def execute(self, sql, params):
+        # record what was executed for assertions
+        self._recorder["sql"] = sql
+        self._recorder["params"] = params
+        exc = self._behavior.get("execute_raises")
+        if exc:
+            raise exc  # simulate SQL error
+
+    async def fetchone(self):
+        return self._behavior.get("row", [1])
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class _FakeConn:
+    """Acts as the object returned by get_connection_pool(...)."""
+
+    def __init__(self, behavior: dict, recorder: dict):
+        self._behavior = behavior or {}
+        self._recorder = recorder
+        self.last_cursor = None
+
+    def cursor(self):
+        self.last_cursor = _FakeCursor(self._behavior, self._recorder)
+        return self.last_cursor
+
+    async def __aenter__(self):
+        exc = self._behavior.get("enter_raises")
+        if exc:
+            raise exc  # simulate pool/connection acquisition failure
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class TestCreateReferralFulfillment(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        # Minimal valid payload
+        self.payload = {
+            "prospectAccountKey": "PAK-1",
+            "prospectAccountKeyType": "EXT",
+            "sorId": "S1",
+            "programCode": "PGR",
+            "referralCode": "REF-42",
+            "referralReferenceKeys": [{"k": "v"}],
         }
 
-    @patch("db_util.connection_pool.AsyncConnectionPool")
-    async def test_create_pool_success(self, mock_pool: AsyncMock) -> None:
-        mock_instance = AsyncMock(spec=AsyncConnectionPool)
-        mock_pool.return_value = mock_instance
+        # Common DB params returned by the secret helper
+        self.db_params = ("db", "user", "pwd", "host", 5432)
 
-        pool = await get_connection_pool(**self.db_args, min_connections=1, max_connections=5)
+    # ---------- Happy path: success on first try ----------
+    @patch("src.database.db.fetch_db_params_from_secret")
+    @patch("src.database.db.get_connection_pool")
+    async def test_success_first_attempt(self, mock_pool, mock_fetch):
+        mock_fetch.return_value = self.db_params
 
-        mock_pool.assert_called_once()
-        mock_instance.open.assert_awaited_once()
-        self.assertEqual(pool, mock_instance)
+        rec = {}
+        mock_pool.return_value = _FakeConn({"row": [111]}, rec)
 
-    @patch("db_util.connection_pool.AsyncConnectionPool")
-    async def test_reuse_existing_pool(self, mock_pool: AsyncMock) -> None:
-        from db_util import connection_pool
-        mock_instance = AsyncMock(spec=AsyncConnectionPool)
-        connection_pool._POOL = mock_instance  # type: ignore[attr-defined]
+        with self.assertLogs(db_module.logger, level="INFO") as logs:
+            rid = await db_module.create_referral_fulfillment(self.payload, retries=3)
 
-        pool = await get_connection_pool(**self.db_args, min_connections=2, max_connections=6)
+        self.assertEqual(rid, "111")
+        # verify SQL + params were passed to cursor.execute
+        self.assertEqual(rec["sql"], db_module._SQL)
+        self.assertEqual(
+            rec["params"],
+            [
+                self.payload["prospectAccountKey"],
+                self.payload["prospectAccountKeyType"],
+                self.payload["sorId"],
+                self.payload["programCode"],
+                self.payload["referralCode"],
+                json.dumps(self.payload["referralReferenceKeys"]),
+            ],
+        )
+        # verify log contains success on attempt 1
+        self.assertTrue(any("db-insert success attempt=1" in line for line in logs.output))
+        mock_fetch.assert_called_once()
 
-        mock_pool.assert_not_called()
-        self.assertIs(pool, mock_instance)
+    # ---------- Success after transient failures (retries) ----------
+    @patch("src.database.db.time.sleep", return_value=None)  # avoid real sleeping
+    @patch("src.database.db.fetch_db_params_from_secret")
+    @patch("src.database.db.get_connection_pool")
+    async def test_success_after_retries(self, mock_pool, mock_fetch, _sleep):
+        mock_fetch.return_value = self.db_params
 
-    async def test_invalid_min_connections(self) -> None:
-        with self.assertRaises(ValueError):
-            await get_connection_pool(**self.db_args, min_connections=0, max_connections=5)
+        # 1st: pool enter fails; 2nd: cursor.execute fails; 3rd: success
+        rec3 = {}
+        mock_pool.side_effect = [
+            _FakeConn({"enter_raises": RuntimeError("pool down")}, {}),
+            _FakeConn({"execute_raises": RuntimeError("sql fail")}, {}),
+            _FakeConn({"row": [222]}, rec3),
+        ]
 
-    async def test_invalid_min_greater_equal_max(self) -> None:
-        with self.assertRaises(ValueError):
-            await get_connection_pool(**self.db_args, min_connections=5, max_connections=5)
+        with self.assertLogs(db_module.logger, level="WARNING") as warn_logs:
+            rid = await db_module.create_referral_fulfillment(self.payload, retries=5)
 
-    async def test_invalid_max_connections_too_large(self) -> None:
-        with self.assertRaises(ValueError):
-            await get_connection_pool(**self.db_args, min_connections=1, max_connections=11)
+        self.assertEqual(rid, "222")
+        # There should be at least two warnings (two failed attempts)
+        self.assertGreaterEqual(len(warn_logs.output), 2)
+        # sleep should have been invoked for backoff twice
+        self.assertGreaterEqual(_sleep.call_count, 2)
+        # final success recorded expected SQL
+        self.assertEqual(rec3["sql"], db_module._SQL)
 
-    @patch("db_util.connection_pool.AsyncConnectionPool")
-    async def test_create_pool_failure(self, mock_pool: AsyncMock) -> None:
-        mock_pool.side_effect = OperationalError("mock failure")
-        with self.assertRaises(OperationalError):
-            await get_connection_pool(**self.db_args, min_connections=1, max_connections=5)
+    # ---------- Exhaustion: raises after all retries ----------
+    @patch("src.database.db.time.sleep", return_value=None)
+    @patch("src.database.db.fetch_db_params_from_secret")
+    @patch("src.database.db.get_connection_pool")
+    async def test_exhausts_retries_and_raises(self, mock_pool, mock_fetch, _sleep):
+        mock_fetch.return_value = self.db_params
+        # fetchone returns None -> module raises RuntimeError each attempt
+        mock_pool.return_value = _FakeConn({"row": None}, {})
 
-    @patch("db_util.connection_pool.AsyncConnectionPool")
-    async def test_close_pool(self, mock_pool: AsyncMock) -> None:
-        from db_util import connection_pool
-        mock_instance = AsyncMock(spec=AsyncConnectionPool)
-        connection_pool._POOL = mock_instance  # type: ignore[attr-defined]
+        with self.assertLogs(db_module.logger, level="ERROR") as err_logs:
+            with self.assertRaises(RuntimeError) as ctx:
+                await db_module.create_referral_fulfillment(self.payload, retries=2)
 
-        await close_connection_pool()
+        self.assertIn("DB returned no referral_id", str(ctx.exception))
+        self.assertTrue(any("db-insert exhausted retries" in l for l in err_logs.output))
+        self.assertEqual(_sleep.call_count, 1)  # one backoff between two attempts
 
-        mock_instance.close.assert_awaited_once()
-        self.assertIsNone(connection_pool._POOL)
+    # ---------- Ensures non-string IDs are converted to string ----------
+    @patch("src.database.db.fetch_db_params_from_secret")
+    @patch("src.database.db.get_connection_pool")
+    async def test_numeric_id_is_cast_to_string(self, mock_pool, mock_fetch):
+        mock_fetch.return_value = self.db_params
+        mock_pool.return_value = _FakeConn({"row": [9876]}, {})
+
+        rid = await db_module.create_referral_fulfillment(self.payload, retries=1)
+        self.assertIsInstance(rid, str)
+        self.assertEqual(rid, "9876")
+
+
+if __name__ == "__main__":
+    unittest.main()
