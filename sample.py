@@ -1,108 +1,100 @@
-# tests/test_main.py
-import json
-import unittest
-from unittest.mock import patch
-
-from src.main import app, create_referral, update_referral, health_check, handle_not_found
 
 
-class FakeEvent:
-    """Minimal object with the bits our handlers read."""
-    def __init__(self, body: dict | None, headers: dict | None = None):
-        self.headers = headers or {"host": "api.example.com", "x-forwarded-proto": "https"}
-        self._body = body
 
-    @property
-    def json_body(self):
-        # Simulate Powertools behavior: if parsing failed, handlers' try/except should catch
-        if self._body is None:
-            raise ValueError("bad json")
-        return self._body
+# tests/test_model.py
+import pytest
+from pydantic import ValidationError
 
-
-def _set_current_event(body: dict | None, headers: dict | None = None):
-    """Handlers read `app.current_event`; older Powertools also stores `_current_event`.
-    Set both to be safe across versions.
-    """
-    fe = FakeEvent(body, headers=headers)
-    setattr(app, "_current_event", fe)
-    setattr(app, "current_event", fe)
+from src.models.model_referral import (
+    ReferralCreateRequest,
+    ReferralReferenceKey,
+    ReferralCreateResponse,
+    ErrorBody,
+    BadRequest,
+    map_validation_to_400xx,
+)
 
 
-class TestHandler(unittest.TestCase):
-    # ------------------------ 201 CREATED ------------------------
-    @patch("src.main.create_referral_fulfillment", return_value="123")
-    def test_201(self, _db):
-        body = {
-            "prospectAccountKey": "123",
-            "prospectAccountKeyType": "CARD_ACCOUNT_ID",
-            "sorId": "S1",
-            "referralReferenceKeys": [],
-            "programCode": "PROGRAM_001",
-            "referralCode": "REFERRAL_ABC",
-        }
-        _set_current_event(body)
-        res = create_referral()
-        self.assertEqual(res["statusCode"], 201)
-        payload = json.loads(res["body"])
-        self.assertEqual(payload["referralId"], "123")
-
-    # ------------------------ 400s ------------------------
-    def test_400_missing_body(self):
-        # Forces the body-parse exception path -> 40001
-        _set_current_event(None)
-        res = create_referral()
-        self.assertEqual(res["statusCode"], 400)
-        body = json.loads(res["body"])
-        self.assertEqual(body["id"], 40001)
-
-    def test_400_validation(self):
-        # Invalid programCode (space) -> validation -> 40005 (or 40002 depending on pydantic message)
-        _set_current_event({
-            "prospectAccountKey": "123",
-            "prospectAccountKeyType": "CARD_ACCOUNT_ID",
-            "sorId": "S1",
-            "referralCode": "REF_001",
-            "programCode": "BAD SPACE",
-        })
-        res = create_referral()
-        self.assertEqual(res["statusCode"], 400)
-        body = json.loads(res["body"])
-        self.assertIn(body["id"], (40005, 40002))  # accept either mapping
-
-    # ------------------------ 500 ------------------------
-    @patch("src.main.create_referral_fulfillment", side_effect=RuntimeError("db down"))
-    def test_500_db(self, _db):
-        good = {
-            "prospectAccountKey": "123",
-            "prospectAccountKeyType": "CARD_ACCOUNT_ID",
-            "sorId": "S1",
-            "programCode": "PROGRAM_001",
-            "referralCode": "REFERRAL_ABC",
-        }
-        _set_current_event(good)
-        res = create_referral()
-        self.assertEqual(res["statusCode"], 500)
-        body = json.loads(res["body"])
-        self.assertEqual(body["id"], 50000)
-
-    # ------------------------ other routes ------------------------
-    def test_health(self):
-        res = health_check()
-        self.assertEqual(res["statusCode"], 200)
-        body = json.loads(res["body"])
-        self.assertEqual(body["status"], "healthy")
-
-    def test_update_referral_204(self):
-        _set_current_event({"x": 1})
-        res = update_referral("abc")
-        self.assertEqual(res["statusCode"], 204)
-        self.assertEqual(res["body"], "")
-
-    def test_not_found_404(self):
-        res = handle_not_found({"path": "/nope"})
-        self.assertEqual(res["statusCode"], 404)
-        body = json.loads(res["body"])
-        self.assertIn("Endpoint does not exist", body.get("error", ""))
+def _good_payload(**overrides):
+    base = {
+        "prospectAccountKey": "123456789",
+        "prospectAccountKeyType": "CARD_ACCOUNT_ID",
+        "sorId": "SOR1",
+        "referralReferenceKeys": [{"referralReferenceKeyName": "X", "referralReferenceKeyValue": "Y"}],
+        "programCode": "PROGRAM_001",
+        "referralCode": "REF_001",
+    }
+    base.update(overrides)
+    return base
 
 
+def test_valid_request_roundtrip():
+    req = ReferralCreateRequest.model_validate(_good_payload())
+    dumped = req.model_dump()
+    assert dumped["programCode"] == "PROGRAM_001"
+    assert dumped["referralCode"] == "REF_001"
+    # simple models
+    resp = ReferralCreateResponse(referralId="42")
+    err = ErrorBody(id=40001, developerText="x")
+    assert resp.referralId == "42" and err.id == 40001
+
+
+def test_missing_field_maps_40001():
+    bad = _good_payload()
+    bad.pop("programCode")
+    with pytest.raises(ValidationError) as e:
+        ReferralCreateRequest.model_validate(bad)
+    code, msg = map_validation_to_400xx(e.value)
+    assert code == 40001
+    assert "Missing required field" in msg
+
+
+def test_invalid_account_key_type_maps_40004():
+    bad = _good_payload(prospectAccountKeyType="NOT_ALLOWED")
+    with pytest.raises(Exception) as e:
+        ReferralCreateRequest.model_validate(bad)
+    code, msg = map_validation_to_400xx(e.value)
+    assert code == 40004
+    assert "account key type" in msg
+
+
+def test_invalid_referral_code_maps_40003():
+    bad = _good_payload(referralCode="bad space")
+    with pytest.raises(Exception) as e:
+        ReferralCreateRequest.model_validate(bad)
+    code, _ = map_validation_to_400xx(e.value)
+    assert code == 40003
+
+
+def test_invalid_program_code_maps_40005():
+    bad = _good_payload(programCode="bad space")
+    with pytest.raises(Exception) as e:
+        ReferralCreateRequest.model_validate(bad)
+    code, _ = map_validation_to_400xx(e.value)
+    assert code == 40005
+
+
+def test_generic_invalid_maps_40002():
+    # Wrong type for referralReferenceKeys -> generic invalid
+    bad = _good_payload(referralReferenceKeys="not-a-list")
+    with pytest.raises(ValidationError) as e:
+        ReferralCreateRequest.model_validate(bad)
+    code, _ = map_validation_to_400xx(e.value)
+    assert code == 40002
+
+
+def test_map_validation_passthrough_for_badrequest():
+    exc = BadRequest(40005, "Invalid referral program code")
+    code, msg = map_validation_to_400xx(exc)
+    assert code == 40005
+    assert "program" in msg.lower()
+
+
+def test_referral_reference_key_model_valid_and_invalid():
+    ok = ReferralReferenceKey(referralReferenceKeyName="A", referralReferenceKeyValue="B")
+    assert ok.referralReferenceKeyName == "A"
+    # too short -> pydantic error -> generic 40002
+    with pytest.raises(ValidationError) as e:
+        ReferralReferenceKey(referralReferenceKeyName="", referralReferenceKeyValue="B")
+    code, _ = map_validation_to_400xx(e.value)
+    assert code == 40002
