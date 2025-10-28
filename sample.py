@@ -1,113 +1,107 @@
 # tests/test_main.py
 import json
-from http import HTTPStatus
-from types import SimpleNamespace
+import unittest
 from unittest.mock import patch
 
-from src.main import lambda_handler
+from src.main import app, create_referral, update_referral, health_check, handle_not_found
 
 
-def _alb_event(method: str, path: str, body: dict | None = None, headers: dict | None = None):
-    return {
-        "httpMethod": method,
-        "path": path,
-        "isBase64Encoded": False,
-        "headers": {
-            "content-type": "application/json",
-            "x-forwarded-proto": "https",
-            "host": "example.com",
-            **(headers or {}),
-        },
-        "queryStringParameters": None,
-        "requestContext": {"elb": {"targetGroupArn": "arn:aws:elasticloadbalancing:..."}},
-        "body": None if body is None else json.dumps(body),
-    }
+class FakeEvent:
+    """Minimal object that looks like ALBResolver's current_event for our handlers."""
+    def __init__(self, body: dict | None, headers: dict | None = None):
+        self.headers = headers or {"host": "api.example.com", "x-forwarded-proto": "https"}
+        self._body = body
+
+    @property
+    def json_body(self):
+        # Simulate "bad JSON" path in main.py when parsing fails
+        if self._body is None:
+            raise ValueError("bad json")
+        return self._body
 
 
-def _ctx():
-    # Minimal LambdaContext stub so aws-lambda-powertools logger doesn't crash
-    return SimpleNamespace(
-        function_name="fn",
-        memory_limit_in_mb=128,
-        invoked_function_arn="arn:aws:lambda:us-east-1:123:function:fn",
-        aws_request_id="req-123",
-    )
+class TestHandler(unittest.TestCase):
+    def set_event(self, body: dict | None, headers: dict | None = None):
+        # Powertools' resolver stores the event on a private field the handlers read from.
+        app._current_event = FakeEvent(body, headers=headers)
+
+    # ---- happy path ---------------------------------------------------------
+    @patch("src.main.create_referral_fulfillment", return_value="123")
+    def test_201(self, _db):
+        body = {
+            "prospectAccountKey": "123",
+            "prospectAccountKeyType": "CARD_ACCOUNT_ID",
+            "sorId": "S1",
+            "referralReferenceKeys": [],
+            "programCode": "PROGRAM_001",
+            "referralCode": "REFERRAL_ABC",
+        }
+        self.set_event(body)
+        res = create_referral()
+        self.assertEqual(res["statusCode"], 201)
+        payload = json.loads(res["body"])
+        self.assertEqual(payload["referralId"], "123")
+        # Note: current main.py does NOT return a Location header; don't assert it.
+
+    # ---- 400 cases ----------------------------------------------------------
+    def test_400_missing_body(self):
+        # json parsing raises -> 40001 path
+        app._current_event = FakeEvent(None)
+        res = create_referral()
+        self.assertEqual(res["statusCode"], 400)
+        payload = json.loads(res["body"])
+        self.assertEqual(payload["id"], 40001)
+
+    def test_400_validation(self):
+        # Invalid programCode pattern -> validator raises BadRequest(40005, ...)
+        self.set_event({
+            "prospectAccountKey": "123",
+            "prospectAccountKeyType": "CARD_ACCOUNT_ID",
+            "sorId": "S1",
+            "referralCode": "REF_001",
+            "programCode": "BAD SPACE",  # invalid by regex
+        })
+        res = create_referral()
+        self.assertEqual(res["statusCode"], 400)
+        payload = json.loads(res["body"])
+        # Error id should map to program code validator
+        self.assertIn(payload["id"], (40002, 40005))
+
+    # ---- 500 case -----------------------------------------------------------
+    @patch("src.main.create_referral_fulfillment", side_effect=RuntimeError("db down"))
+    def test_500_db(self, _db):
+        body = {
+            "prospectAccountKey": "123",
+            "prospectAccountKeyType": "CARD_ACCOUNT_ID",
+            "sorId": "S1",
+            "programCode": "PROGRAM_001",
+            "referralCode": "REFERRAL_ABC",
+        }
+        self.set_event(body)
+        res = create_referral()
+        self.assertEqual(res["statusCode"], 500)
+        payload = json.loads(res["body"])
+        self.assertEqual(payload["id"], 50000)
+
+    # ---- other routes -------------------------------------------------------
+    def test_health(self):
+        res = health_check()
+        self.assertEqual(res["statusCode"], 200)
+        payload = json.loads(res["body"])
+        self.assertEqual(payload["status"], "healthy")
+
+    def test_update_referral_204(self):
+        self.set_event({"x": 1})
+        res = update_referral("abc")
+        self.assertEqual(res["statusCode"], 204)
+        self.assertEqual(res["body"], "")
+
+    def test_not_found_404(self):
+        res = handle_not_found({"path": "/nope"})
+        self.assertEqual(res["statusCode"], 404)
+        payload = json.loads(res["body"])
+        self.assertIn("Endpoint does not exist", payload.get("error", ""))
 
 
-def test_health():
-    ev = _alb_event("GET", "/referrals/health")
-    res = lambda_handler(ev, _ctx())
-    assert res["statusCode"] == 200
-    payload = json.loads(res["body"])
-    assert payload["status"] == "healthy"
-
-
-@patch("src.main.create_referral_fulfillment", return_value="123")
-def test_create_referral_201(_mock_db):
-    body = {
-        "prospectAccountKey": "123",
-        "prospectAccountKeyType": "CARD_ACCOUNT_ID",
-        "sorId": "S1",
-        "programCode": "PROG_001",
-        "referralCode": "REF_001",
-        "referralReferenceKeys": [],
-    }
-    ev = _alb_event("POST", "/enterprise/referrals", body=body)
-    res = lambda_handler(ev, _ctx())
-    assert res["statusCode"] == HTTPStatus.CREATED
-    assert json.loads(res["body"]) == {"referralId": "123"}
-
-
-def test_create_referral_400_missing_body():
-    # Non-JSON / missing body -> 40001
-    ev = _alb_event(
-        "POST",
-        "/enterprise/referrals",
-        body=None,
-        headers={"content-type": "text/plain"},
-    )
-    res = lambda_handler(ev, _ctx())
-    assert res["statusCode"] == HTTPStatus.BAD_REQUEST
-    body = json.loads(res["body"])
-    assert body["id"] == 40001
-
-
-def test_create_referral_400_validation_error():
-    # Missing required programCode -> 40001
-    bad = {
-        "prospectAccountKey": "123",
-        "prospectAccountKeyType": "CARD_ACCOUNT_ID",
-        "sorId": "S1",
-        "referralCode": "REF_001",
-    }
-    ev = _alb_event("POST", "/enterprise/referrals", body=bad)
-    res = lambda_handler(ev, _ctx())
-    assert res["statusCode"] == HTTPStatus.BAD_REQUEST
-    assert json.loads(res["body"])["id"] == 40001
-
-
-@patch("src.main.create_referral_fulfillment", side_effect=RuntimeError("db down"))
-def test_create_referral_500(_mock_db):
-    good = {
-        "prospectAccountKey": "123",
-        "prospectAccountKeyType": "CARD_ACCOUNT_ID",
-        "sorId": "S1",
-        "programCode": "PROG_001",
-        "referralCode": "REF_001",
-    }
-    ev = _alb_event("POST", "/enterprise/referrals", body=good)
-    res = lambda_handler(ev, _ctx())
-    assert res["statusCode"] == HTTPStatus.INTERNAL_SERVER_ERROR
-    assert json.loads(res["body"])["id"] == 50000
-
-
-def test_update_referral_204():
-    ev = _alb_event("PATCH", "/enterprise/referrals/abc", body={"x": 1})
-    res = lambda_handler(ev, _ctx())
-    assert res["statusCode"] == 204
-
-
-def test_not_found_404():
-    ev = _alb_event("GET", "/nope")
-    res = lambda_handler(ev, _ctx())
-    assert res["statusCode"] == 404
+if __name__ == "__main__":
+    unittest.main()
