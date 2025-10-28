@@ -1,13 +1,16 @@
-@app.post("/enterprise/referrals")
-def create_referral() -> Dict[str, Any]:
-    body = app.current_event.json_body or {}
-    req = ReferralCreateRequest.model_validate(body)
+# tests/test_main.py
+from types import SimpleNamespace
+from src.main import app  # wherever your `app` object lives
 
-    event_id = app.lambda_context.aws_request_id                 # UUID string
-    correlation_id = app.current_event.request_context["requestId"]  # from context
+EVENT_UUID = "924c2586-7958-4fce-8296-53c73076019e"
+REQ_ID     = "req-123"
 
-    rid = create_referral_fulfillment(req.model_dump(), event_id, correlation_id)
+def _set_current_event(body: dict) -> None:
+    class FakeEvent:
+        def __init__(self, body):
+            self.json_body = body
+            self.request_context = {"requestId": REQ_ID}
 
-    created_at = datetime.now(timezone.utc).isoformat()
-    path = f"/enterprise/referrals/{rid}"
-    return _resp(HTTPStatus.CREATED, {"referralId": rid, "createdAt": created_at, "path": path})
+    fe = FakeEvent(body)
+    setattr(app, "current_event", fe)
+    setattr(app, "lambda_context", SimpleNamespace(aws_request_id=EVENT_UUID))
