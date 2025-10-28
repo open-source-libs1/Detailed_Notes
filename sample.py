@@ -1,41 +1,37 @@
-FulfillmentIamRole:
-  Type: Custom::AvenueRole
-  Properties:
-    ServiceToken: !Sub arn:aws:sns:${AWS::Region}:116250504297:avenue-cloudformation
-    RoleName: !Sub referrals-fulfillment-api-lambda-role-${EnvironmentType}-${AWS::Region}
-    TrustDoc:
-      Version: '2012-10-17'
-      Statement:
-        - Effect: Allow
-          Action: sts:AssumeRole
-          Principal:
-            Service: lambda.amazonaws.com
+from pyspark.sql.functions import when, col, lit
 
-    # ⬇️ Modify this block
-    PolicyDoc:
-      Version: '2012-10-17'
-      Statement:
-        - Sid: AllowInvoke
-          Effect: Allow
-          Action: lambda:InvokeFunction
-          Resource: '*'
-        - Sid: SecretsManagerRead
-          Effect: Allow
-          Action:
-            - secretsmanager:GetSecretValue
-            - secretsmanager:DescribeSecret
-            - secretsmanager:ListSecretVersionIds
-          # scope to your secret path; adjust if yours differs
-          Resource:
-            - !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:cof/cos/db/postgres/*
-        # If the secret uses a customer-managed KMS key, keep this block; otherwise remove it.
-        - Sid: KmsDecryptForSecrets
-          Effect: Allow
-          Action: kms:Decrypt
-          Resource: arn:aws:kms:us-east-1:${AWS::AccountId}:key/<YOUR-CMK-ID>
+condition_col = "Final_Network"
 
-    Tags:
-      - Key: BA
-        Value: !Ref BA
-      - Key: OwnerContact
-        Value: !Ref OwnerContact
+# Spark Connect-safe emptiness check
+is_empty = Excl_Revenue_Combined_NPG_DF.limit(1).count() == 0
+
+if not is_empty:
+    condition_exp = None
+    for condition_val, cat_name in final_network_conditions:
+        condition_exp = when(condition_val, lit(cat_name)) if condition_exp is None \
+                        else condition_exp.when(condition_val, lit(cat_name))
+    Excl_Revenue_Combined_NPG_DF = (
+        Excl_Revenue_Combined_NPG_DF
+        .withColumn(condition_col, condition_exp.otherwise(lit("Unknown")))
+    )
+else:
+    # Keep a DataFrame (not a string) so downstream code still works
+    if condition_col not in Excl_Revenue_Combined_NPG_DF.columns:
+        Excl_Revenue_Combined_NPG_DF = Excl_Revenue_Combined_NPG_DF.withColumn(
+            condition_col, lit(None).cast("string")
+        )
+    # Optional: log/message instead of overwriting the DF
+    print("No records present for the Scenario ID")
+
+# Safe casting (works even if the DF is empty)
+decimal_columns_to_cast = [
+    "NumClaims","AWP_Total","Acquisition_Cost","Cogs_Trad_PBM_Total",
+    "Cogs_Trans_PBM_Total","Cogs_Dispsn_Fee_Trans_PBM_Total",
+    "Cogs_Trad_Medi_Total","Cogs_Trans_Medi_Total",
+    "Cogs_Dispsn_Fee_Trad_Medi_Total"
+]
+for clm in decimal_columns_to_cast:
+    if clm in Excl_Revenue_Combined_NPG_DF.columns:
+        Excl_Revenue_Combined_NPG_DF = Excl_Revenue_Combined_NPG_DF.withColumn(
+            clm, col(clm).cast("double")
+        )
