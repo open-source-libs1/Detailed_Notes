@@ -1,31 +1,14 @@
-
-
 {
-  "requestContext": { "elb": { "targetGroupArn": "arn:aws:elasticloadbalancing:us-east-1:123456789012:targetgroup/demo/abc123" } },
+  "requestContext": { "elb": { "targetGroupArn": "arn:aws:elasticloadbalancing:us-east-1:111122223333:targetgroup/test/abc123" } },
   "httpMethod": "POST",
   "path": "/enterprise/referrals",
   "queryStringParameters": {},
   "headers": {
     "content-type": "application/json",
     "x-forwarded-proto": "https",
-    "x-forwarded-for": "127.0.0.1",
     "x-forwarded-port": "443",
     "user-agent": "aws-console-test"
   },
-  "body": "{\"applicationName\":\"enterprise-portal\",\"referralType\":\"FULFILLMENT\",\"requestId\":\"REQ-2025-0001\",\"customerId\":\"CUST-001\",\"source\":\"web\",\"payload\":{\"sku\":\"SKU-001\",\"quantity\":1}}",
-  "isBase64Encoded": false
-}
-
-
-
-{ "requestContext": { "elb": {} }, "httpMethod": "POST", "path": "/enterprise/referrals", "headers": { "content-type": "application/json" }, "body": "", "isBase64Encoded": false }
-
-
-{
-  "requestContext": { "elb": {} },
-  "httpMethod": "PATCH",
-  "path": "/enterprise/referrals/12345",
-  "headers": { "content-type": "application/json" },
-  "body": "{\"status\":\"CANCELLED\"}",
+  "body": "{\"prospectAccountKey\":\"123456789\",\"prospectAccountKeyType\":\"CARD_ACCOUNT_ID\",\"sorId\":\"SOR123\",\"referralReferenceKeys\":[{\"referralReferenceKeyName\":\"CUSTOMER_BONUS_TRANSACTION_ID\",\"referralReferenceKeyValue\":\"string\"}],\"programCode\":\"PROGRAM_001\",\"referralCode\":\"REFERRAL_ABC\"}",
   "isBase64Encoded": false
 }
