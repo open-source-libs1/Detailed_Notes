@@ -1,9 +1,10 @@
 def compare_tables_from_config(config: dict, scenario_id: str = None, lob_id: int = None, uw_req_id: str = None, show_queries: bool = True):
     """
-    MySQL vs StarRocks comparison with:
-      - per-table filter mode (scenario_id / uw_req_id / both)
-      - optional lob_id filter (configurable per table)
-      - query printout for debugging
+    Enhanced MySQL vs StarRocks comparison with:
+      - Per-table filter modes (scenario_id / uw_req_id / both)
+      - Optional lob_id inclusion
+      - Automatic fallback to SELECT * when key_columns list is empty
+      - Query printouts for debugging
     """
 
     import binascii
@@ -17,13 +18,13 @@ def compare_tables_from_config(config: dict, scenario_id: str = None, lob_id: in
         starrocks_table = cfg["starrocks_table"]
         db_mysql = cfg.get("db_mysql", "comp_engine_microservice_output")
         db_starrocks = cfg.get("db_starrocks", "comp_engine_microservice_output_qa")
-        key_cols = cfg["key_columns"]
-        compare_cols = cfg["compare_columns"]
+        key_cols = cfg.get("key_columns", [])
+        compare_cols = cfg.get("compare_columns", [])
         uuid_cols = cfg.get("uuid_columns", [])
         filters = cfg.get("filters", "")
         mysql_mode = cfg.get("mysql_filter_mode", "both").lower()
         starrocks_mode = cfg.get("starrocks_filter_mode", "both").lower()
-        use_lob = cfg.get("use_lob_filter", True)   # 👈 NEW FLAG
+        use_lob = cfg.get("use_lob_filter", True)
 
         # --- WHERE condition builders ---
         def build_conditions(mode, engine):
@@ -44,30 +45,46 @@ def compare_tables_from_config(config: dict, scenario_id: str = None, lob_id: in
         if not mysql_where and not starrocks_where:
             raise ValueError(f"⚠️ Table {table_name}: missing valid filter fields.")
 
-        # --- Build SQL queries ---
-        cols_expr = ", ".join([f"round(sum(p.{col}), 0) as {col}" for col in compare_cols])
-        group_cols = ", ".join(key_cols)
-
-        # Conditional LOB filter inclusion
+        # --- LOB filter logic ---
         lob_clause = f"AND p.lob_id = {lob_id}" if use_lob and lob_id is not None else ""
 
-        mysql_query = f"""
-            SELECT {group_cols}, {cols_expr}
-            FROM {db_mysql}.{mysql_table} p
-            WHERE {mysql_where}
-              {lob_clause} {filters}
-            GROUP BY {group_cols}
-            ORDER BY {group_cols}
-        """
+        # --- Build SQL queries ---
+        if key_cols:  # ✅ Aggregated mode (grouped)
+            cols_expr = ", ".join([f"round(sum(p.{col}), 0) as {col}" for col in compare_cols])
+            group_cols = ", ".join(key_cols)
 
-        starrocks_query = f"""
-            SELECT {group_cols}, {cols_expr}
-            FROM {db_starrocks}.{starrocks_table} p
-            WHERE {starrocks_where}
-              {lob_clause} {filters}
-            GROUP BY {group_cols}
-            ORDER BY {group_cols}
-        """
+            mysql_query = f"""
+                SELECT {group_cols}, {cols_expr}
+                FROM {db_mysql}.{mysql_table} p
+                WHERE {mysql_where}
+                  {lob_clause} {filters}
+                GROUP BY {group_cols}
+                ORDER BY {group_cols}
+            """
+
+            starrocks_query = f"""
+                SELECT {group_cols}, {cols_expr}
+                FROM {db_starrocks}.{starrocks_table} p
+                WHERE {starrocks_where}
+                  {lob_clause} {filters}
+                GROUP BY {group_cols}
+                ORDER BY {group_cols}
+            """
+        else:  # ✅ Detail mode (no grouping)
+            print(f"ℹ️ Table {table_name} has no key_columns defined — using SELECT * mode.")
+            mysql_query = f"""
+                SELECT *
+                FROM {db_mysql}.{mysql_table} p
+                WHERE {mysql_where}
+                  {lob_clause} {filters}
+            """
+
+            starrocks_query = f"""
+                SELECT *
+                FROM {db_starrocks}.{starrocks_table} p
+                WHERE {starrocks_where}
+                  {lob_clause} {filters}
+            """
 
         # --- Print generated queries ---
         if show_queries:
@@ -103,28 +120,43 @@ def compare_tables_from_config(config: dict, scenario_id: str = None, lob_id: in
                 if col in starrocks_pd.columns:
                     starrocks_pd[col] = starrocks_pd[col].astype(str)
 
-        for col in key_cols:
-            if col in mysql_pd.columns:
-                mysql_pd[col] = mysql_pd[col].astype(str).str.lower().str.strip()
-            if col in starrocks_pd.columns:
-                starrocks_pd[col] = starrocks_pd[col].astype(str).str.lower().str.strip()
+        if key_cols:
+            for col in key_cols:
+                if col in mysql_pd.columns:
+                    mysql_pd[col] = mysql_pd[col].astype(str).str.lower().str.strip()
+                if col in starrocks_pd.columns:
+                    starrocks_pd[col] = starrocks_pd[col].astype(str).str.lower().str.strip()
 
         # --- Key diagnostics ---
-        mysql_keys = set(tuple(x) for x in mysql_pd[key_cols].dropna().values.tolist())
-        starrocks_keys = set(tuple(x) for x in starrocks_pd[key_cols].dropna().values.tolist())
-        print(f"🔹 MySQL keys: {len(mysql_keys)} | StarRocks keys: {len(starrocks_keys)}")
+        mysql_keys = len(mysql_pd) if not key_cols else len(mysql_pd[key_cols].dropna())
+        starrocks_keys = len(starrocks_pd) if not key_cols else len(starrocks_pd[key_cols].dropna())
+        print(f"🔹 MySQL rows: {mysql_keys} | StarRocks rows: {starrocks_keys}")
 
         # --- Merge datasets ---
-        merged = mysql_pd.merge(
-            starrocks_pd,
-            on=key_cols,
-            how="outer",
-            suffixes=("_mysql", "_starrocks"),
-            indicator=True
-        )
+        if key_cols:
+            merged = mysql_pd.merge(
+                starrocks_pd,
+                on=key_cols,
+                how="outer",
+                suffixes=("_mysql", "_starrocks"),
+                indicator=True
+            )
+        else:
+            # If no keys, align by index for comparison
+            merged = mysql_pd.merge(
+                starrocks_pd,
+                left_index=True,
+                right_index=True,
+                how="outer",
+                suffixes=("_mysql", "_starrocks"),
+                indicator=True
+            )
 
         # --- Compare each metric ---
-        for col in compare_cols:
+        compare_targets = compare_cols if compare_cols else [
+            c for c in mysql_pd.columns if c in starrocks_pd.columns
+        ]
+        for col in compare_targets:
             def compare_row(row):
                 mysql_val = row.get(f"{col}_mysql")
                 starrocks_val = row.get(f"{col}_starrocks")
@@ -144,14 +176,15 @@ def compare_tables_from_config(config: dict, scenario_id: str = None, lob_id: in
 
         merged["table_name"] = table_name
 
-        # --- Order columns logically ---
+        # --- Column order ---
         ordered_cols = []
-        ordered_cols.extend(key_cols)
-        for col in compare_cols:
+        if key_cols:
+            ordered_cols.extend(key_cols)
+        for col in compare_targets:
             ordered_cols.extend([f"{col}_mysql", f"{col}_starrocks", f"{col}_Result"])
         ordered_cols.append("table_name")
 
-        merged = merged[ordered_cols]
+        merged = merged[[c for c in ordered_cols if c in merged.columns]]
         unified_results.append(merged)
 
         print(f"✅ Completed comparison for: {table_name}")
@@ -173,17 +206,17 @@ final_results_df = compare_tables_from_config(
 
 
 
-???????????????????
+///////////////////////
 
 
-"pnl_wac_prcnt": {
-    "mysql_table": "pnl_wac_prcnt",
-    "starrocks_table": "pnl_wac_prcnt_tc",
-    "key_columns": ["rebate_pricing_group_id"],
-    "compare_columns": ["benchmark_srx", "benchmark_total", "client_srx", "client_total"],
-    "uuid_columns": ["rebate_pricing_group_id"],
+"pnl_claim_detail": {
+    "mysql_table": "pnl_claim_detail",
+    "starrocks_table": "pnl_claim_detail_tc",
+    "key_columns": [],  # 👈 triggers SELECT *
+    "compare_columns": [],  # auto infer overlap
+    "uuid_columns": [],
     "filters": "",
     "mysql_filter_mode": "uw_req_id",
-    "starrocks_filter_mode": "scenario_id",
-    "use_lob_filter": False   # 👈 Table does NOT have lob_id
+    "starrocks_filter_mode": "uw_req_id",
+    "use_lob_filter": False
 }
