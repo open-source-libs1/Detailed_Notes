@@ -1,7 +1,9 @@
 def compare_tables_from_config(config: dict, scenario_id: str = None, lob_id: int = None, uw_req_id: str = None, show_queries: bool = True):
     """
-    MySQL vs StarRocks comparison with per-table filter-mode control.
-    Now also prints the generated SQL queries for debugging.
+    MySQL vs StarRocks comparison with:
+      - per-table filter mode (scenario_id / uw_req_id / both)
+      - optional lob_id filter (configurable per table)
+      - query printout for debugging
     """
 
     import binascii
@@ -21,8 +23,9 @@ def compare_tables_from_config(config: dict, scenario_id: str = None, lob_id: in
         filters = cfg.get("filters", "")
         mysql_mode = cfg.get("mysql_filter_mode", "both").lower()
         starrocks_mode = cfg.get("starrocks_filter_mode", "both").lower()
+        use_lob = cfg.get("use_lob_filter", True)   # 👈 NEW FLAG
 
-        # --- Build WHERE conditions ---
+        # --- WHERE condition builders ---
         def build_conditions(mode, engine):
             conds = []
             if mode in ("scenario_id", "both") and scenario_id:
@@ -45,11 +48,14 @@ def compare_tables_from_config(config: dict, scenario_id: str = None, lob_id: in
         cols_expr = ", ".join([f"round(sum(p.{col}), 0) as {col}" for col in compare_cols])
         group_cols = ", ".join(key_cols)
 
+        # Conditional LOB filter inclusion
+        lob_clause = f"AND p.lob_id = {lob_id}" if use_lob and lob_id is not None else ""
+
         mysql_query = f"""
             SELECT {group_cols}, {cols_expr}
             FROM {db_mysql}.{mysql_table} p
             WHERE {mysql_where}
-              AND p.lob_id = {lob_id} {filters}
+              {lob_clause} {filters}
             GROUP BY {group_cols}
             ORDER BY {group_cols}
         """
@@ -58,7 +64,7 @@ def compare_tables_from_config(config: dict, scenario_id: str = None, lob_id: in
             SELECT {group_cols}, {cols_expr}
             FROM {db_starrocks}.{starrocks_table} p
             WHERE {starrocks_where}
-              AND p.lob_id = {lob_id} {filters}
+              {lob_clause} {filters}
             GROUP BY {group_cols}
             ORDER BY {group_cols}
         """
@@ -72,8 +78,17 @@ def compare_tables_from_config(config: dict, scenario_id: str = None, lob_id: in
             print("-" * 80)
 
         # --- Execute queries ---
-        mysql_df = mysqlConnection(db_mysql, mysql_query)
-        starrocks_df = starrocksConnection(db_starrocks, starrocks_query)
+        try:
+            mysql_df = mysqlConnection(db_mysql, mysql_query)
+        except Exception as e:
+            print(f"❌ MySQL query failed for {table_name}: {e}")
+            continue
+
+        try:
+            starrocks_df = starrocksConnection(db_starrocks, starrocks_query)
+        except Exception as e:
+            print(f"❌ StarRocks query failed for {table_name}: {e}")
+            continue
 
         mysql_pd = mysql_df.toPandas()
         starrocks_pd = starrocks_df.toPandas()
@@ -153,5 +168,22 @@ final_results_df = compare_tables_from_config(
     scenario_id=scenario_id if scenario_id else None,
     lob_id=lob_id,
     uw_req_id=uw_req_id if uw_req_id else None,
-    show_queries=True   # 👈 enable/disable SQL logging
+    show_queries=True
 )
+
+
+
+???????????????????
+
+
+"pnl_wac_prcnt": {
+    "mysql_table": "pnl_wac_prcnt",
+    "starrocks_table": "pnl_wac_prcnt_tc",
+    "key_columns": ["rebate_pricing_group_id"],
+    "compare_columns": ["benchmark_srx", "benchmark_total", "client_srx", "client_total"],
+    "uuid_columns": ["rebate_pricing_group_id"],
+    "filters": "",
+    "mysql_filter_mode": "uw_req_id",
+    "starrocks_filter_mode": "scenario_id",
+    "use_lob_filter": False   # 👈 Table does NOT have lob_id
+}
