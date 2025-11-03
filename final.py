@@ -1,53 +1,7 @@
-# --- Table Configuration ---
-table_config = {
-    "pbm_sensitivities": {
-        "mysql_table": "pbm_sensitivities",
-        "starrocks_table": "pbm_sensitivities",
-        "key_columns": [
-            "proj_year",
-            "channel_group_id",
-            "pharmacy_capped_noncapped_id",
-            "network_pricing_group_id"
-        ],
-        "compare_columns": [
-            "total_claims", "brand_claims", "brand_zbd_claims", "brand_awp",
-            "incl_brand_awp", "excl_brand_awp", "brand_revenue",
-            "generic_claims", "generic_zbd_claims", "generic_awp",
-            "incl_generic_awp", "excl_generic_awp", "generic_revenue",
-            "zinc_value"
-        ],
-        "uuid_columns": ["network_pricing_group_id"],
-        "filters": "",
-        # 👇 control how WHERE clause is built per source
-        "mysql_filter_mode": "both",        # options: "scenario_id", "uw_req_id", "both"
-        "starrocks_filter_mode": "scenario_id"  # options: "scenario_id", "uw_req_id", "both"
-    },
-
-    "pbm_summary": {
-        "mysql_table": "pbm_summary",
-        "starrocks_table": "pbm_summary",
-        "key_columns": ["proj_year", "channel_group_id"],
-        "compare_columns": ["total_revenue", "brand_revenue", "generic_revenue"],
-        "uuid_columns": [],
-        "filters": "",
-        "mysql_filter_mode": "uw_req_id",
-        "starrocks_filter_mode": "uw_req_id"
-    },
-
-    # Add additional tables as needed...
-}
-
-
-
-////////////////////////
-
-
-def compare_tables_from_config(config: dict, scenario_id: str = None, lob_id: int = None, uw_req_id: str = None):
+def compare_tables_from_config(config: dict, scenario_id: str = None, lob_id: int = None, uw_req_id: str = None, show_queries: bool = True):
     """
-    MySQL vs StarRocks comparison.
-    Each table config controls whether to filter by scenario_id, uw_req_id, or both.
-    Generates unified result:
-        <metric>_mysql | <metric>_starrocks | <metric>_Result
+    MySQL vs StarRocks comparison with per-table filter-mode control.
+    Now also prints the generated SQL queries for debugging.
     """
 
     import binascii
@@ -56,7 +10,7 @@ def compare_tables_from_config(config: dict, scenario_id: str = None, lob_id: in
     for table_name, cfg in config.items():
         print(f"\n🔍 Comparing table: {table_name}")
 
-        # --- Extract config values ---
+        # --- Extract configuration ---
         mysql_table = cfg["mysql_table"]
         starrocks_table = cfg["starrocks_table"]
         db_mysql = cfg.get("db_mysql", "comp_engine_microservice_output")
@@ -68,7 +22,7 @@ def compare_tables_from_config(config: dict, scenario_id: str = None, lob_id: in
         mysql_mode = cfg.get("mysql_filter_mode", "both").lower()
         starrocks_mode = cfg.get("starrocks_filter_mode", "both").lower()
 
-        # --- WHERE condition builders ---
+        # --- Build WHERE conditions ---
         def build_conditions(mode, engine):
             conds = []
             if mode in ("scenario_id", "both") and scenario_id:
@@ -109,9 +63,18 @@ def compare_tables_from_config(config: dict, scenario_id: str = None, lob_id: in
             ORDER BY {group_cols}
         """
 
+        # --- Print generated queries ---
+        if show_queries:
+            print("\n🟦 MySQL Query:")
+            print(mysql_query)
+            print("\n🟩 StarRocks Query:")
+            print(starrocks_query)
+            print("-" * 80)
+
         # --- Execute queries ---
         mysql_df = mysqlConnection(db_mysql, mysql_query)
         starrocks_df = starrocksConnection(db_starrocks, starrocks_query)
+
         mysql_pd = mysql_df.toPandas()
         starrocks_pd = starrocks_df.toPandas()
 
@@ -145,7 +108,7 @@ def compare_tables_from_config(config: dict, scenario_id: str = None, lob_id: in
             indicator=True
         )
 
-        # --- Compare metrics ---
+        # --- Compare each metric ---
         for col in compare_cols:
             def compare_row(row):
                 mysql_val = row.get(f"{col}_mysql")
@@ -189,5 +152,6 @@ final_results_df = compare_tables_from_config(
     config=table_config,
     scenario_id=scenario_id if scenario_id else None,
     lob_id=lob_id,
-    uw_req_id=uw_req_id if uw_req_id else None
+    uw_req_id=uw_req_id if uw_req_id else None,
+    show_queries=True   # 👈 enable/disable SQL logging
 )
