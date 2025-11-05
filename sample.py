@@ -1,4 +1,2 @@
-
-
-rebateOutput = spark.read.format("delta").load('abfss://gold@sbmuscapfdatala.../RebateSummarization')
+rebateOutput = spark.table("puma_qa.ce.rebate_summarization")
 rebateOutput.createOrReplaceTempView("Rebate")
