@@ -1,11 +1,5 @@
-# Rebate
-rebateOutput = spark.table("puma_qa.ce.rebate_summarization")
-rebateOutput.createOrReplaceTempView("Rebate")
-
-# Specialty
-specialtyOutput = spark.table("puma_qa.ce.specialty_summarization")
-specialtyOutput.createOrReplaceTempView("Specialty")
-
-# Revenue
-revenueOutput = spark.table("puma_qa.ce.revenue_summarization")
-revenueOutput.createOrReplaceTempView("Revenue")
+curl -k -X POST "https://api-it.cloud.capitalone.com/oauth2/token" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  --data-urlencode "grant_type=client_credentials" \
+  --data-urlencode "client_id=" \
+  --data-urlencode "client_secret="
