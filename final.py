@@ -1,6 +1,27 @@
-SELECT now() AS current_time,
-       current_database(),
-       current_user,
-       count(*) AS total_tables
-FROM information_schema.tables
-WHERE table_schema = 'public';
+
+
+
+python -m venv .venv
+
+
+.\.venv\Scripts\activate
+
+
+pip install --upgrade pip
+
+
+pip install -r requirements.txt
+
+
+pip install -r requirements-dev.txt
+
+
+pytest
+
+
+pytest --cov-fail-under=50 --cov-branch --cov-config=.coveragerc --cov=. tests -s
+
+//////////////////
+
+.\.venv\Scripts\activate
+pytest --cov-fail-under=50 --cov-branch --cov-config=.coveragerc --cov=. tests -s
