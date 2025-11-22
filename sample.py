@@ -1,129 +1,31 @@
-# Cell 1: Widgets / User inputs
-# Purpose: drive environment, compared DB, and table category list.
-
-mysql_key = "mysql"
-postgres_key = "postgres"
-starrocks_key = "starrocks"
-
-property_columns_all = [
-    "TABLE_SCHEMA",
-    "TABLE_NAME",
-    "COLUMN_NAME",
-    "DATA_TYPE",
-    "CHARACTER_MAXIMUM_LENGTH",
-    "NUMERIC_PRECISION",
-    "NUMERIC_SCALE",
-    "IS_NULLABLE",
-    "COLUMN_DEFAULT",
-    "COLUMN_KEY",
-    "ORDINAL_POSITION",
-]
-
-dbutils.widgets.multiselect("Property Columns", property_columns_all[0], property_columns_all)
-dbutils.widgets.dropdown("Env", "QA", ["QA", "DEV", "PPRD", "PROD", "PRD"])
-dbutils.widgets.dropdown("Compared DB", "StarRocks", ["StarRocks", "Postgres"])
-dbutils.widgets.dropdown("Table Type", "Artifact", ["Artifact", "Input", "Output", "Staging"])
-
-selected_property_columns = dbutils.widgets.get("Property Columns")
-environment = dbutils.widgets.get("Env")
-compared_db = dbutils.widgets.get("Compared DB")
-table_type = dbutils.widgets.get("Table Type")
-
-print("Selected Property Columns:", selected_property_columns)
-print("Env:", environment)
-print("Compared DB:", compared_db)
-print("Table Type:", table_type)
-
-
-
-######################################################
-
-# Cell 2: Schema resolution + selection options
-# Purpose: map table_type → mysql schema + compared schema + list of tables.
-
-# --- MySQL schemas ---
-mysql_artifact_schema = "comp_engine_microservice"
-mysql_input_schema    = "comp_engine_microservice"
-mysql_output_schema   = "comp_engine_microservice_output"
-mysql_staging_schema  = "comp_engine_microservice"
-
-# --- Postgres schemas if needed (kept for compatibility) ---
-postgres_artifact_schema = "artifacts"
-postgres_rebate_schema = "rebate"
-postgres_rebate_output_schema = "rebate_output"
-
-# --- StarRocks schemas (env-based like your snippet) ---
-starrocks_artifact_schema = f"artifactsdb_{environment.lower()}"
-starrocks_input_schema    = f"comp_engine_microservice_{environment.lower()}"
-starrocks_output_schema   = f"comp_engine_microservice_output_{environment.lower()}"
-starrocks_staging_schema  = f"stagedb_{environment.lower()}"
-
-compared_key = ""
-compared_artifact_schema = ""
-compared_input_schema = ""
-compared_output_schema = ""
-compared_staging_schema = ""
-
-if compared_db == "StarRocks":
-    compared_key = starrocks_key
-    compared_artifact_schema = starrocks_artifact_schema
-    compared_input_schema    = starrocks_input_schema
-    compared_output_schema   = starrocks_output_schema
-    compared_staging_schema  = starrocks_staging_schema
-else:
-    compared_key = postgres_key
-    compared_artifact_schema = postgres_artifact_schema
-    compared_input_schema    = postgres_rebate_schema
-    compared_output_schema   = postgres_rebate_output_schema
-    compared_staging_schema  = postgres_rebate_schema
-
-# ---- Your helper functions must exist ----
-# def get_artifact_tables(): ...
-# def get_input_tables(): ...
-# def get_output_tables(): ...
-# def get_staging_tables(): ...
-
-selection_options = {
-    "Artifact": {
-        mysql_key: mysql_artifact_schema,
-        "compared_schema": compared_artifact_schema,
-        "tables": get_artifact_tables(),
-    },
-    "Input": {
-        mysql_key: mysql_input_schema,
-        "compared_schema": compared_input_schema,
-        "tables": get_input_tables(),
-    },
-    "Output": {
-        mysql_key: mysql_output_schema,
-        "compared_schema": compared_output_schema,
-        "tables": get_output_tables(),
-    },
-    "Staging": {
-        mysql_key: mysql_staging_schema,
-        "compared_schema": compared_staging_schema,
-        "tables": get_staging_tables(),
-    },
-}
-
-reference_tables = selection_options[table_type]["tables"]
-mysql_schema = selection_options[table_type][mysql_key]
-compared_schema = selection_options[table_type]["compared_schema"]
-
-print("MySQL schema:", mysql_schema)
-print("Compared schema:", compared_schema)
-print("Num tables:", len(reference_tables))
-
-
-
-#########################################
-
-# Cell 3: Ignore columns + datatype normalization
+# schema_compare_library - Cell A1
+# Purpose: shared utilities for schema comparison.
 
 import re
 import pandas as pd
 
-IGNORE_COLUMNS = {"createdAt", "updatedAt"}  # case-insensitive
+def upper_cols(df):
+    """
+    Safely uppercases DF column names.
+    - Spark DF: uses toDF (columns are read-only)
+    - Pandas DF: assigns df.columns
+    """
+    if df is None:
+        return df
+
+    if hasattr(df, "toDF") and not isinstance(df, pd.DataFrame):
+        return df.toDF(*[c.upper() for c in df.columns])
+
+    df.columns = [c.upper() for c in df.columns]
+    return df
+
+
+def quote_list(vals):
+    """Quote strings for SQL IN (...)"""
+    return ",".join([f"'{v}'" for v in vals])
+
+# schema_compare_library - Cell A2
+# Purpose: normalize MySQL/StarRocks data types into a common form.
 
 MYSQL_TO_SR_CANON = {
     "int": "int", "integer": "int", "tinyint": "int", "smallint": "int", "bigint": "bigint", "bit": "int",
@@ -179,11 +81,8 @@ def normalize_starrocks_dtype(dtype, char_len=None, num_precision=None, num_scal
     return canon
 
 
-
-###############################
-
-
-# Cell 4: Queries + wrappers
+# schema_compare_library - Cell A3
+# Purpose: standard metadata queries.
 
 MYSQL_COLUMNS_QUERY = """
 SELECT
@@ -230,79 +129,57 @@ ORDER BY s.TABLE_NAME, s.INDEX_NAME, s.SEQ_IN_INDEX
 
 STARROCKS_SHOW_CREATE = "SHOW CREATE TABLE {schema}.{table}"
 
-def quote_list(vals):
-    return ",".join([f"'{v}'" for v in vals])
+# schema_compare_library - Cell A4
+# Purpose: fetch schema/keys from source or target.
 
-def run_mysql(schema, query):
-    return mysqlConnection(schema, query)
-
-def run_starrocks(schema, query):
-    return starrocksConnection(schema, query)
-
-
-
-
-####################################
-
-
-# Cell 5: DEBUG A
-# Purpose: if something fails, you can see exact queries.
-
-print("---- MySQL columns query ----")
-print(MYSQL_COLUMNS_QUERY.format(schema=mysql_schema, tables=quote_list(reference_tables[:5])))
-
-print("\n---- Compared columns query ----")
-print(COMPARED_COLUMNS_QUERY.format(schema=compared_schema, tables=quote_list(reference_tables[:5])))
-
-print("\n---- MySQL PK query ----")
-print(MYSQL_PK_QUERY.format(schema=mysql_schema, tables=quote_list(reference_tables[:5])))
-
-print("\n---- MySQL unique query ----")
-print(MYSQL_UNIQUE_QUERY.format(schema=mysql_schema, tables=quote_list(reference_tables[:5])))
-
-
-
-#######################
-
-
-
-# Cell 6: Fetch schema + MySQL keys
-
-def fetch_columns(schema, tables, db_key):
+def fetch_columns(schema, tables, db_key, mysql_key, run_mysql, run_starrocks):
+    """
+    Fetch columns for mysql or compared db.
+    The run_* functions must accept (schema, query) and return Spark DF.
+    """
     if not tables:
         return pd.DataFrame()
+
     q = (MYSQL_COLUMNS_QUERY if db_key == mysql_key else COMPARED_COLUMNS_QUERY).format(
         schema=schema, tables=quote_list(tables)
     )
-    df = run_mysql(schema, q) if db_key == mysql_key else run_starrocks(schema, q)
-    df.columns = [c.upper() for c in df.columns]
-    return df
 
-def fetch_mysql_keys(schema, tables):
+    df = run_mysql(schema, q) if db_key == mysql_key else run_starrocks(schema, q)
+    return upper_cols(df)
+
+
+def fetch_mysql_keys(schema, tables, run_mysql):
+    """Fetch MySQL PK + UNIQUE indexes."""
     if not tables:
         return pd.DataFrame(), pd.DataFrame()
-    tlist = quote_list(tables)
 
+    tlist = quote_list(tables)
     pk = run_mysql(schema, MYSQL_PK_QUERY.format(schema=schema, tables=tlist))
     uq = run_mysql(schema, MYSQL_UNIQUE_QUERY.format(schema=schema, tables=tlist))
 
-    pk.columns = [c.upper() for c in pk.columns]
-    uq.columns = [c.upper() for c in uq.columns]
-    return pk, uq
-
-mysql_cols = fetch_columns(mysql_schema, reference_tables, mysql_key)
-compared_cols = fetch_columns(compared_schema, reference_tables, compared_key)
-mysql_pk_df, mysql_uq_df = fetch_mysql_keys(mysql_schema, reference_tables)
+    return upper_cols(pk), upper_cols(uq)
 
 
-
-###########################
-
-# Cell 7: Normalize column metadata for fair comparison
+# schema_compare_library - Cell A5
+# Purpose: add normalized dtype + helper columns to compare fairly.
 
 def prepare_columns_df(df, db_kind):
+    """
+    Converts Spark → pandas for apply-based normalization.
+    Adds:
+      COLUMN_NAME_UPPER
+      NORMALIZED_DATA_TYPE
+      IS_NULLABLE upper
+    """
+    if df is None:
+        return df
+
+    if hasattr(df, "toPandas") and not isinstance(df, pd.DataFrame):
+        df = df.toPandas()
+
     if df.empty:
         return df
+
     df = df.copy()
     df["COLUMN_NAME_UPPER"] = df["COLUMN_NAME"].str.upper()
     df["IS_NULLABLE"] = df["IS_NULLABLE"].str.upper()
@@ -323,28 +200,28 @@ def prepare_columns_df(df, db_kind):
             ),
             axis=1
         )
+
     return df
 
-mysql_cols = prepare_columns_df(mysql_cols, "mysql")
-compared_cols = prepare_columns_df(compared_cols, "starrocks" if compared_key == starrocks_key else "postgres")
+# schema_compare_library - Cell A6
+# Purpose: pull StarRocks SHOW CREATE TABLE and parse key model/cols.
 
-
-
-
-############################
-
-# Cell 8: StarRocks DDL parsing for keys
-# Matches your sample:
-#   DUPLICATE KEY(`uw_req_id`)
-#   ORDER BY(`uw_req_id`, `lob_id`, ...)
-
-def fetch_starrocks_ddl(schema, table):
+def fetch_starrocks_ddl(schema, table, run_starrocks):
     ddl_df = run_starrocks(schema, STARROCKS_SHOW_CREATE.format(schema=schema, table=table))
+
+    if ddl_df is None:
+        return ""
+
+    if hasattr(ddl_df, "toPandas") and not isinstance(ddl_df, pd.DataFrame):
+        ddl_df = ddl_df.toPandas()
+
     if ddl_df.empty:
         return ""
-    return str(ddl_df.iloc[0, 1])  # create stmt
 
-def parse_starrocks_keys_from_ddl(ddl):
+    return str(ddl_df.iloc[0, 1])
+
+
+def parse_starrocks_keys_from_ddl(ddl: str):
     ddl_l = ddl.lower()
 
     def extract_cols(keyword):
@@ -386,50 +263,32 @@ def parse_starrocks_keys_from_ddl(ddl):
         "SR_ORDER_BY_COLUMNS": order_by_cols,
     }
 
+# schema_compare_library - Cell A7
+# Purpose: actual comparison logic.
 
-
-###################
-
-# Cell 9: DEBUG B
-# Call this for any table to see its DDL + parsed keys.
-
-def debug_starrocks_ddl(table):
-    ddl = fetch_starrocks_ddl(compared_schema, table)
-    parsed = parse_starrocks_keys_from_ddl(ddl)
-    print(f"\n--- DDL for {compared_schema}.{table} ---\n")
-    print(ddl)
-    print("\n--- Parsed ---")
-    print(parsed)
-
-
-
-########################
-
-# Cell 10: Column-level compare
-
-def compare_table_columns(mysql_t, compared_t, ignore_columns):
+def compare_table_columns(source_t, target_t, ignore_columns):
     ignore_upper = {c.upper() for c in ignore_columns}
 
-    m = mysql_t[~mysql_t["COLUMN_NAME_UPPER"].isin(ignore_upper)]
-    s = compared_t[~compared_t["COLUMN_NAME_UPPER"].isin(ignore_upper)]
+    s = source_t[~source_t["COLUMN_NAME_UPPER"].isin(ignore_upper)]
+    t = target_t[~target_t["COLUMN_NAME_UPPER"].isin(ignore_upper)]
 
-    m_cols = set(m["COLUMN_NAME_UPPER"])
     s_cols = set(s["COLUMN_NAME_UPPER"])
-    all_cols = sorted(m_cols.union(s_cols))
+    t_cols = set(t["COLUMN_NAME_UPPER"])
+    all_cols = sorted(s_cols.union(t_cols))
 
-    m_idx = m.set_index("COLUMN_NAME_UPPER")
     s_idx = s.set_index("COLUMN_NAME_UPPER")
+    t_idx = t.set_index("COLUMN_NAME_UPPER")
 
     rows = []
     for c in all_cols:
-        mrow = m_idx.loc[c] if c in m_idx.index else None
         srow = s_idx.loc[c] if c in s_idx.index else None
+        trow = t_idx.loc[c] if c in t_idx.index else None
 
-        if mrow is None:
-            rows.append({"COLUMN_NAME": c, "STATUS": "MISSING_IN_MYSQL"})
-            continue
         if srow is None:
-            rows.append({"COLUMN_NAME": c, "STATUS": "MISSING_IN_COMPARED"})
+            rows.append({"COLUMN_NAME": c, "STATUS": "MISSING_IN_SOURCE"})
+            continue
+        if trow is None:
+            rows.append({"COLUMN_NAME": c, "STATUS": "MISSING_IN_TARGET"})
             continue
 
         diffs = {}
@@ -443,23 +302,17 @@ def compare_table_columns(mysql_t, compared_t, ignore_columns):
         ]
 
         for norm_key, raw_key in checks:
-            mv = mrow.get(norm_key, mrow.get(raw_key))
             sv = srow.get(norm_key, srow.get(raw_key))
-            if pd.isna(mv) and pd.isna(sv):
+            tv = trow.get(norm_key, trow.get(raw_key))
+            if pd.isna(sv) and pd.isna(tv):
                 continue
-            if str(mv) != str(sv):
-                diffs[raw_key] = {"mysql": mv, "compared": sv}
+            if str(sv) != str(tv):
+                diffs[raw_key] = {"source": sv, "target": tv}
 
         rows.append({"COLUMN_NAME": c, "STATUS": "MATCH" if not diffs else "DIFF", "DIFFS": diffs})
 
     return pd.DataFrame(rows)
 
-
-
-##########################
-
-
-# Cell 11: Key compare
 
 def mysql_pk_list(df_pk, table):
     d = df_pk[df_pk["TABLE_NAME"].str.lower() == table.lower()]
@@ -475,14 +328,10 @@ def mysql_unique_indexes(df_uq, table):
         out[str(idx).upper()] = cols
     return out
 
-def compare_keys(table):
+
+def compare_keys(table, mysql_pk_df, mysql_uq_df, sr_parsed):
     m_pk = mysql_pk_list(mysql_pk_df, table)
     m_uq = mysql_unique_indexes(mysql_uq_df, table)
-
-    ddl = fetch_starrocks_ddl(compared_schema, table) if compared_key == starrocks_key else ""
-    sr_parsed = parse_starrocks_keys_from_ddl(ddl) if ddl else {
-        "SR_KEY_MODEL": "N/A", "SR_KEY_COLUMNS": [], "SR_UNIQUE_COLUMNS": [], "SR_ORDER_BY_COLUMNS": []
-    }
 
     pk_match = (sr_parsed["SR_KEY_MODEL"] == "PRIMARY KEY" and m_pk == sr_parsed["SR_KEY_COLUMNS"])
 
@@ -500,88 +349,329 @@ def compare_keys(table):
     }
 
 
+########################################
 
 
-#################################
+%run "./schema_compare_library"
 
 
-# Cell 12: DEBUG C
-# If a table fails, we surface it immediately with extra context.
+# schema_compare_runner - Cell B2
+# Purpose: choose any Source/Target env + DB combo.
 
-def debug_table(table):
-    print(f"\n### DEBUG TABLE: {table} ###")
-    m_t = mysql_cols[mysql_cols["TABLE_NAME"].str.lower() == table.lower()]
-    s_t = compared_cols[compared_cols["TABLE_NAME"].str.lower() == table.lower()]
-    print("MySQL columns:", len(m_t), "Compared columns:", len(s_t))
-    if compared_key == starrocks_key:
-        debug_starrocks_ddl(table)
+dbutils.widgets.dropdown("Source Env", "QA", ["QA", "PPD-1", "PRD"])
+dbutils.widgets.dropdown("Source DB", "MySQL", ["MySQL", "StarRocks"])
+
+dbutils.widgets.dropdown("Target Env", "PRD", ["QA", "PPD-1", "PRD"])
+dbutils.widgets.dropdown("Target DB", "StarRocks", ["MySQL", "StarRocks"])
+
+dbutils.widgets.dropdown("Table Type", "Artifact", ["Artifact", "Input", "Output", "Staging"])
+dbutils.widgets.dropdown("Debug Mode", "false", ["true", "false"])
+
+source_env = dbutils.widgets.get("Source Env")
+source_db  = dbutils.widgets.get("Source DB")
+target_env = dbutils.widgets.get("Target Env")
+target_db  = dbutils.widgets.get("Target DB")
+table_type = dbutils.widgets.get("Table Type")
+debug_mode = dbutils.widgets.get("Debug Mode").lower() == "true"
+
+print("Source:", source_env, source_db)
+print("Target:", target_env, target_db)
+print("Table Type:", table_type)
+print("Debug Mode:", debug_mode)
+
+
+####################
+
+# schema_compare_runner - Cell B3
+# Purpose: load your connection functions and map env/db to callable.
+
+# CHANGE THIS PATH to your connections notebook
+%run "./all_connections_mysql_sr"
+
+# ---- Map env to your EXACT function names ----
+def get_mysql_runner(env: str):
+    env = env.upper()
+    if env == "QA":
+        return mysqlConnection_qa
+    if env == "PPD-1":
+        return mysqlConnection_ppd_1
+    if env == "PRD":
+        return mysqlConnection_prd
+    raise ValueError(f"Unknown MySQL env: {env}")
+
+def get_starrocks_runner(env: str):
+    env = env.upper()
+    if env == "QA":
+        return starrocksConnection_qa
+    if env == "PPD-1":
+        return starrocksConnection_ppd_1
+    if env == "PRD":
+        return starrocksConnection_prd
+    raise ValueError(f"Unknown StarRocks env: {env}")
+
+def get_runner(db: str, env: str):
+    return get_mysql_runner(env) if db == "MySQL" else get_starrocks_runner(env)
+
+run_source = get_runner(source_db, source_env)
+run_target = get_runner(target_db, target_env)
 
 
 
 
-#####################################
+###################
+
+
+# schema_compare_runner - Cell B4
+
+def resolve_mysql_schemas():
+    return {
+        "Artifact": "comp_engine_microservice",
+        "Input":    "comp_engine_microservice",
+        "Output":   "comp_engine_microservice_output",
+        "Staging":  "comp_engine_microservice",
+    }
+
+def resolve_starrocks_schemas(env: str):
+    e = env.lower()
+    return {
+        "Artifact": f"artifactsdb_{e}",
+        "Input":    f"comp_engine_microservice_{e}",
+        "Output":   f"comp_engine_microservice_output_{e}",
+        "Staging":  f"stagedb_{e}",
+    }
+
+def get_side_schema(db: str, env: str, table_type: str) -> str:
+    return resolve_mysql_schemas()[table_type] if db == "MySQL" else resolve_starrocks_schemas(env)[table_type]
+
+source_schema = get_side_schema(source_db, source_env, table_type)
+target_schema = get_side_schema(target_db, target_env, table_type)
+
+print("Source schema:", source_schema)
+print("Target schema:", target_schema)
 
 
 
-# Cell 13: Run comparisons + summary/detail reports
 
-from pyspark.sql import SparkSession
-spark = SparkSession.builder.getOrCreate()
+######################
 
-detail_results = {}
-key_results = []
-summary_rows = []
 
-for t in reference_tables:
-    try:
-        m_t = mysql_cols[mysql_cols["TABLE_NAME"].str.lower() == t.lower()]
-        s_t = compared_cols[compared_cols["TABLE_NAME"].str.lower() == t.lower()]
 
-        col_diff_df = compare_table_columns(m_t, s_t, IGNORE_COLUMNS)
-        detail_results[t] = col_diff_df
+# schema_compare_runner - Cell B5
+# Purpose: pick tables by category.
 
-        key_diff = compare_keys(t)
-        key_results.append({"TABLE_NAME": t, **key_diff})
+selection_tables = {
+    "Artifact": get_artifact_tables(),
+    "Input":    get_input_tables(),
+    "Output":   get_output_tables(),
+    "Staging":  get_staging_tables(),
+}
 
-        issues = col_diff_df[col_diff_df["STATUS"].isin(["DIFF","MISSING_IN_MYSQL","MISSING_IN_COMPARED"])]
-        summary_rows.append({
-            "TABLE_NAME": t,
-            "COLUMN_PASS": issues.empty,
-            "NUM_COLUMN_ISSUES": int(len(issues)),
-            "PK_MATCH": key_diff["PK_MATCH"],
-            "UNIQUE_MATCH": key_diff["UNIQUE_MATCH"],
-            "SR_KEY_MODEL": key_diff["SR_KEY_MODEL"],
-            "OVERALL_PASS": (issues.empty and key_diff["PK_MATCH"] and key_diff["UNIQUE_MATCH"]),
-        })
+reference_tables = selection_tables[table_type]
+print("Num tables:", len(reference_tables))
 
-    except Exception as e:
-        print(f"[ERROR] Table={t} failed: {e}")
-        debug_table(t)
-        summary_rows.append({
-            "TABLE_NAME": t,
-            "COLUMN_PASS": False,
-            "NUM_COLUMN_ISSUES": -1,
-            "PK_MATCH": False,
-            "UNIQUE_MATCH": False,
-            "SR_KEY_MODEL": "ERROR",
-            "OVERALL_PASS": False,
-            "ERROR": str(e),
-        })
+
 
 
 
 ##########################
 
 
-# Cell 14: Summary + key results
+# schema_compare_runner - Cell B6
+
+IGNORE_COLUMNS = {"createdAt", "updatedAt"}
+
+
+
+##########################
+
+
+# schema_compare_runner - Cell B7 (DEBUG)
+
+if debug_mode:
+    sample_tables = reference_tables[:5]
+    print("MySQL/Compared columns SQL sample:")
+    print(MYSQL_COLUMNS_QUERY.format(schema=source_schema, tables=quote_list(sample_tables)))
+    print(COMPARED_COLUMNS_QUERY.format(schema=target_schema, tables=quote_list(sample_tables)))
+
+
+
+###########################
+
+
+# schema_compare_runner - Cell B8
+
+mysql_key = "mysql"
+source_key = "mysql" if source_db == "MySQL" else "starrocks"
+target_key = "mysql" if target_db == "MySQL" else "starrocks"
+
+source_cols_raw = fetch_columns(
+    schema=source_schema,
+    tables=reference_tables,
+    db_key=source_key,
+    mysql_key=mysql_key,
+    run_mysql=run_source,         # only used if source_key==mysql
+    run_starrocks=run_source      # only used if source_key==starrocks
+)
+
+target_cols_raw = fetch_columns(
+    schema=target_schema,
+    tables=reference_tables,
+    db_key=target_key,
+    mysql_key=mysql_key,
+    run_mysql=run_target,
+    run_starrocks=run_target
+)
+
+source_cols = prepare_columns_df(source_cols_raw, "mysql" if source_db=="MySQL" else "starrocks")
+target_cols = prepare_columns_df(target_cols_raw, "mysql" if target_db=="MySQL" else "starrocks")
+
+
+
+#######################
+
+
+# schema_compare_runner - Cell B9 (DEBUG)
+
+if debug_mode and reference_tables:
+    t0 = reference_tables[0]
+    print("Sample table:", t0)
+    display(source_cols[source_cols["TABLE_NAME"].str.lower()==t0.lower()])
+    display(target_cols[target_cols["TABLE_NAME"].str.lower()==t0.lower()])
+
+
+
+#####################
+
+
+# schema_compare_runner - Cell B10
+
+mysql_pk_df, mysql_uq_df = pd.DataFrame(), pd.DataFrame()
+mysql_side = None
+
+if source_db == "MySQL":
+    mysql_side = "source"
+    mysql_pk_df, mysql_uq_df = fetch_mysql_keys(source_schema, reference_tables, run_source)
+
+elif target_db == "MySQL":
+    mysql_side = "target"
+    mysql_pk_df, mysql_uq_df = fetch_mysql_keys(target_schema, reference_tables, run_target)
+
+# Spark → pandas if needed
+if hasattr(mysql_pk_df, "toPandas") and not isinstance(mysql_pk_df, pd.DataFrame):
+    mysql_pk_df = mysql_pk_df.toPandas()
+if hasattr(mysql_uq_df, "toPandas") and not isinstance(mysql_uq_df, pd.DataFrame):
+    mysql_uq_df = mysql_uq_df.toPandas()
+
+
+
+######################
+
+
+# schema_compare_runner - Cell B11
+
+from pyspark.sql import SparkSession
+spark = SparkSession.builder.getOrCreate()
+
+detail_results = {}
+key_rows = []
+summary_rows = []
+
+for t in reference_tables:
+    try:
+        s_t = source_cols[source_cols["TABLE_NAME"].str.lower() == t.lower()]
+        t_t = target_cols[target_cols["TABLE_NAME"].str.lower() == t.lower()]
+
+        col_diff_df = compare_table_columns(s_t, t_t, IGNORE_COLUMNS)
+        detail_results[t] = col_diff_df
+
+        # ---- Keys ----
+        if source_db == "StarRocks" and target_db == "StarRocks":
+            ddl_s = fetch_starrocks_ddl(source_schema, t, run_source)
+            ddl_t = fetch_starrocks_ddl(target_schema, t, run_target)
+
+            sr_s = parse_starrocks_keys_from_ddl(ddl_s)
+            sr_t = parse_starrocks_keys_from_ddl(ddl_t)
+
+            key_rows.append({
+                "TABLE_NAME": t,
+                "SOURCE_SR_KEY_MODEL": sr_s["SR_KEY_MODEL"],
+                "SOURCE_SR_KEY_COLUMNS": sr_s["SR_KEY_COLUMNS"],
+                "SOURCE_SR_UNIQUE_COLUMNS": sr_s["SR_UNIQUE_COLUMNS"],
+                "SOURCE_SR_ORDER_BY_COLUMNS": sr_s["SR_ORDER_BY_COLUMNS"],
+                "TARGET_SR_KEY_MODEL": sr_t["SR_KEY_MODEL"],
+                "TARGET_SR_KEY_COLUMNS": sr_t["SR_KEY_COLUMNS"],
+                "TARGET_SR_UNIQUE_COLUMNS": sr_t["SR_UNIQUE_COLUMNS"],
+                "TARGET_SR_ORDER_BY_COLUMNS": sr_t["SR_ORDER_BY_COLUMNS"],
+                "KEY_MODEL_MATCH": sr_s["SR_KEY_MODEL"] == sr_t["SR_KEY_MODEL"],
+                "KEY_COLUMNS_MATCH": sr_s["SR_KEY_COLUMNS"] == sr_t["SR_KEY_COLUMNS"],
+                "UNIQUE_COLUMNS_MATCH": sr_s["SR_UNIQUE_COLUMNS"] == sr_t["SR_UNIQUE_COLUMNS"],
+                "ORDER_BY_MATCH": sr_s["SR_ORDER_BY_COLUMNS"] == sr_t["SR_ORDER_BY_COLUMNS"],
+            })
+
+            pk_match = True
+            uq_match = True
+            key_model = f"{sr_s['SR_KEY_MODEL']} vs {sr_t['SR_KEY_MODEL']}"
+
+        else:
+            # MySQL ↔ StarRocks
+            if source_db == "StarRocks":
+                ddl = fetch_starrocks_ddl(source_schema, t, run_source)
+                sr_parsed = parse_starrocks_keys_from_ddl(ddl)
+            elif target_db == "StarRocks":
+                ddl = fetch_starrocks_ddl(target_schema, t, run_target)
+                sr_parsed = parse_starrocks_keys_from_ddl(ddl)
+            else:
+                sr_parsed = {"SR_KEY_MODEL":"N/A","SR_KEY_COLUMNS":[],"SR_UNIQUE_COLUMNS":[],"SR_ORDER_BY_COLUMNS":[]}
+
+            key_diff = compare_keys(t, mysql_pk_df, mysql_uq_df, sr_parsed)
+            key_rows.append({"TABLE_NAME": t, **key_diff})
+
+            pk_match = key_diff["PK_MATCH"]
+            uq_match = key_diff["UNIQUE_MATCH"]
+            key_model = key_diff["SR_KEY_MODEL"]
+
+        issues = col_diff_df[col_diff_df["STATUS"].isin(["DIFF","MISSING_IN_SOURCE","MISSING_IN_TARGET"])]
+        summary_rows.append({
+            "TABLE_NAME": t,
+            "COLUMN_PASS": issues.empty,
+            "NUM_COLUMN_ISSUES": int(len(issues)),
+            "PK_MATCH": pk_match,
+            "UNIQUE_MATCH": uq_match,
+            "KEY_MODEL": key_model,
+            "OVERALL_PASS": (issues.empty and pk_match and uq_match),
+        })
+
+    except Exception as e:
+        print(f"[ERROR] Table={t} failed: {e}")
+        if debug_mode and (source_db=="StarRocks" or target_db=="StarRocks"):
+            try:
+                if source_db=="StarRocks":
+                    print(fetch_starrocks_ddl(source_schema, t, run_source))
+                if target_db=="StarRocks":
+                    print(fetch_starrocks_ddl(target_schema, t, run_target))
+            except Exception:
+                pass
+
+        summary_rows.append({
+            "TABLE_NAME": t,
+            "COLUMN_PASS": False,
+            "NUM_COLUMN_ISSUES": -1,
+            "PK_MATCH": False,
+            "UNIQUE_MATCH": False,
+            "KEY_MODEL": "ERROR",
+            "OVERALL_PASS": False,
+            "ERROR": str(e),
+        })
 
 summary_df = pd.DataFrame(summary_rows).sort_values("TABLE_NAME")
-keys_df = pd.DataFrame(key_results).sort_values("TABLE_NAME")
+keys_df = pd.DataFrame(key_rows).sort_values("TABLE_NAME")
 
-# Optional: filter output columns based on widget "Property Columns"
-selected_cols_list = [c.strip().upper() for c in selected_property_columns.split(",") if c.strip()]
-# summary_df doesn't need filtering; keys_df also doesn't.
-# detail view will still show diffs fully (better for debugging).
+
+
+#################
+
+
+# schema_compare_runner - Cell B12
 
 display(spark.createDataFrame(summary_df))
 display(spark.createDataFrame(keys_df))
@@ -589,20 +679,12 @@ display(spark.createDataFrame(keys_df))
 
 
 
-############################
+###################
 
-
-# Cell 15: Detailed diffs per table
+# schema_compare_runner - Cell B13
 
 for t, df in detail_results.items():
     print(f"\n===== {t} (Schema diff) =====")
     display(spark.createDataFrame(df))
-
-
-
-
-
-
-
 
 
