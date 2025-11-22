@@ -45,4 +45,24 @@ def compare_basic(tables, mysql_db, sr_db):
             "sr_only_cols": col_diff_sr_only
         })
 
+
+
+    /////////////
+
+
+    tables = [
+    "admin_billing",
+    "assumption",
+    "claims_billing",
+    "opportunity",
+    "sensitivity",
+    # add more...
+]
+
+mysql_db = "comp_engine_microservice"
+sr_db    = "artifactdb_prd"
+
+summary = compare_basic(tables, mysql_db, sr_db)
+display(spark.createDataFrame(summary))
+
     return results
