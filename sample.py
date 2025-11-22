@@ -1,12 +1,48 @@
-pass_fail_df = compare_pass_fail_df2(...)
+def compare_basic(tables, mysql_db, sr_db):
+    results = []
 
-# --- insert patch here ---
-ignore_cols = {"created_at", "updated_at"}
-pass_fail_df["COLUMN_NAME_lower"] = pass_fail_df["COLUMN_NAME"].str.lower()
-pass_fail_df.loc[
-    pass_fail_df["COLUMN_NAME_lower"].isin(ignore_cols), "Result"
-] = "Pass"
-pass_fail_df.drop(columns=["COLUMN_NAME_lower"], inplace=True)
-# ---------------------------
+    for t in tables:
+        print(f"\n============================")
+        print(f"Comparing table: {t}")
+        print(f"============================")
 
-reference_table_result_dfs[table_name] = pass_fail_df
+        # Build queries
+        mysql_q = f"SELECT * FROM {mysql_db}.{t}"
+        sr_q    = f"SELECT * FROM {sr_db}.{t}"
+
+        print("MySQL Query     :", mysql_q)
+        print("StarRocks Query :", sr_q)
+
+        # Execute queries
+        mysql_df = mysqlConnection(mysql_db, mysql_q)
+        sr_df    = starrocksConnection(sr_db, sr_q)
+
+        # Row counts
+        mysql_count = mysql_df.count()
+        sr_count    = sr_df.count()
+
+        # Columns
+        mysql_cols = set(mysql_df.columns)
+        sr_cols    = set(sr_df.columns)
+
+        col_diff_mysql_only = sorted(list(mysql_cols - sr_cols))
+        col_diff_sr_only    = sorted(list(sr_cols - mysql_cols))
+
+        # Print summary
+        print(f"MySQL Row Count     : {mysql_count}")
+        print(f"StarRocks Row Count : {sr_count}")
+        print(f"Row Count Match?    : {mysql_count == sr_count}")
+
+        print(f"Columns in MySQL not in SR : {col_diff_mysql_only}")
+        print(f"Columns in SR not in MySQL : {col_diff_sr_only}")
+        print(f"Column Match?               : {len(col_diff_mysql_only)==0 and len(col_diff_sr_only)==0}")
+
+        results.append({
+            "table": t,
+            "mysql_count": mysql_count,
+            "sr_count": sr_count,
+            "mysql_only_cols": col_diff_mysql_only,
+            "sr_only_cols": col_diff_sr_only
+        })
+
+    return results
