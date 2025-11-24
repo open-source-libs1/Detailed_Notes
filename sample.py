@@ -1,176 +1,81 @@
 import pandas as pd
-from io import BytesIO
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.mime.application import MIMEApplication
 
-def _df_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "data") -> bytes:
-    bio = BytesIO()
-    try:
-        with pd.ExcelWriter(bio, engine="xlsxwriter") as writer:
-            df.to_excel(writer, index=False, sheet_name=sheet_name[:31])
-    except Exception:
-        with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name=sheet_name[:31])
-    bio.seek(0)
-    return bio.read()
+# ------------- 1) Build summary DF from log_data ----------------
 
-def _overall_summary_to_html(df: pd.DataFrame, title: str = "Overall Summary") -> str:
+def build_summary_df_from_log(log_data):
     """
-    Renders Overall Summary with conditional coloring:
-      - Passed column green
-      - Failed column red
-      - If Failed > 0, highlight row lightly in red tint
-    Works even if column names are slightly different (case/space tolerant).
+    log_data: list[dict] mixed (metadata + summary dicts)
+    Returns:
+      summary_df: detailed per-table summary rows only
     """
-    if df is None or df.empty:
-        return f"<h3>{title}</h3><p><i>No rows.</i></p>"
+    if not log_data:
+        return pd.DataFrame()
 
-    # Normalize column lookup
-    cols_norm = {c: c.strip().lower() for c in df.columns}
-    passed_col = next((c for c,n in cols_norm.items() if n in ("passed", "pass", "passed_cnt")), None)
-    failed_col = next((c for c,n in cols_norm.items() if n in ("failed", "fail", "failed_cnt")), None)
+    df = pd.DataFrame(log_data)
 
-    def fmt_cell(value, col_name):
-        if col_name == passed_col:
-            return f'<span style="color:#1a7f37;font-weight:700;">{value}</span>'  # green
-        if col_name == failed_col:
-            return f'<span style="color:#d1242f;font-weight:700;">{value}</span>'  # red
-        return str(value)
+    # Keep only summary rows (must have these columns)
+    required_cols = {"Table", "Total_Tests", "Passed", "Failed"}
+    present_cols = set(df.columns)
 
-    # Build rows manually so we can style per cell/row
-    header_cells = "".join(
-        f'<th style="border:1px solid #ddd;padding:6px 8px;background:#f2f2f2;text-align:left;">{c}</th>'
-        for c in df.columns
+    if not required_cols.issubset(present_cols):
+        # try case-insensitive match if columns came in with diff case
+        lower_map = {c.lower(): c for c in df.columns}
+        req_lower = {c.lower() for c in required_cols}
+        if req_lower.issubset(set(lower_map.keys())):
+            df = df.rename(columns={lower_map[k]: k.title().replace("_", "_") for k in req_lower})
+        else:
+            return pd.DataFrame()
+
+    # Filter to only those rows where Table is not null
+    df = df[df["Table"].notna()].copy()
+
+    # Normalize types
+    for c in ["Total_Tests", "Passed", "Failed"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
+
+    # Ensure identifier cols exist (in case some runs didn't add them)
+    for c in ["uw_req_id", "scenario_id", "lob", "run_id", "start_time", "end_time", "duration"]:
+        if c not in df.columns:
+            df[c] = None
+
+    # Optional: standardize lob to string so groupby is clean
+    df["lob"] = df["lob"].astype(str)
+
+    return df
+
+summary_df = build_summary_df_from_log(log_data)
+display(summary_df)
+
+
+# ------------- 2) Aggregate per (uw_req_id, scenario_id, lob) and overall -------------
+
+def build_aggregates(summary_df: pd.DataFrame):
+    if summary_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    # Per-combo aggregation
+    group_cols = ["uw_req_id", "scenario_id", "lob"]
+    combo_summary_df = (
+        summary_df
+        .groupby(group_cols, dropna=False, as_index=False)[["Total_Tests", "Passed", "Failed"]]
+        .sum()
+        .sort_values(group_cols)
     )
 
-    body_rows = []
-    for _, row in df.iterrows():
-        # row-level tint if failed > 0
-        row_failed_val = 0
-        if failed_col is not None:
-            try:
-                row_failed_val = int(row[failed_col]) if pd.notna(row[failed_col]) else 0
-            except Exception:
-                row_failed_val = 0
+    # Overall per-table across all combos (this is what you show inline)
+    overall_summary_df = (
+        summary_df
+        .groupby(["Table"], as_index=False)[["Total_Tests", "Passed", "Failed"]]
+        .sum()
+        .sort_values("Failed", ascending=False)
+    )
 
-        tr_style = 'background:#fff5f5;' if row_failed_val > 0 else ''
-        tds = []
-        for c in df.columns:
-            v = "" if pd.isna(row[c]) else row[c]
-            tds.append(
-                f'<td style="border:1px solid #ddd;padding:6px 8px;text-align:left;">{fmt_cell(v, c)}</td>'
-            )
-        body_rows.append(f'<tr style="{tr_style}">' + "".join(tds) + "</tr>")
+    return combo_summary_df, overall_summary_df
 
-    table_html = f"""
-    <h3>{title}</h3>
-    <table style="border-collapse:collapse;font-family:Arial,sans-serif;font-size:13px;">
-      <thead><tr>{header_cells}</tr></thead>
-      <tbody>
-        {''.join(body_rows)}
-      </tbody>
-    </table>
-    """
-    return table_html
+combo_summary_df, overall_summary_all_df = build_aggregates(summary_df)
 
-def send_email_report(
-    recipients,
-    subject,
-    overall_df: pd.DataFrame,
-    summary_df: pd.DataFrame,
-    failed_df: pd.DataFrame,
-    # NEW: identifiers shown at top
-    parent_request_id=None,
-    scenario_id=None,
-    lob=None,
-    sender="saisrikar.ravipati@cvshealth.com",
-    smtp_host="smtppaz.corp.cvscaremark.com",
-    smtp_port=25,
-    use_starttls=True
-):
-    # --- Identifiers block (only show what is provided) ---
-    ident_lines = []
-    if parent_request_id:
-        ident_lines.append(f"<b>PARENT_REQUEST_ID:</b> {parent_request_id}")
-    if scenario_id:
-        ident_lines.append(f"<b>SCENARIO_ID:</b> {scenario_id}")
-    if lob:
-        ident_lines.append(f"<b>LOB:</b> {lob}")
-    ident_html = ""
-    if ident_lines:
-        ident_html = """
-        <div style="border:1px solid #ddd;background:#f7f7f7;padding:10px 12px;
-                    font-family:Arial,sans-serif;font-size:13px;border-radius:6px;margin-bottom:12px;">
-          {lines}
-        </div>
-        """.format(lines="<br/>".join(ident_lines))
+print("Per-combination summary:")
+display(combo_summary_df)
 
-    # --- Overall Summary inline with colors ---
-    overall_html = _overall_summary_to_html(overall_df, title="Overall Summary")
-
-    html_body = f"""
-    <html>
-      <body style="font-family:Arial,sans-serif;">
-        <p>Hello Team,</p>
-        {ident_html}
-        <p>Below is the Overall Summary for this run:</p>
-        {overall_html}
-        <p style="margin-top:12px;">Attached: Summary All DF and Failed DFS DF as Excel files.</p>
-        <p>Thanks!</p>
-      </body>
-    </html>
-    """
-
-    # --- Attachments as Excel ---
-    attachments = []
-    if summary_df is not None:
-        attachments.append(("summary_all_df.xlsx", _df_to_excel_bytes(summary_df, "summary_all")))
-    if failed_df is not None:
-        attachments.append(("failed_dfs_df.xlsx", _df_to_excel_bytes(failed_df, "failed_dfs")))
-
-    msg = MIMEMultipart()
-    msg["Subject"] = subject
-    msg["From"] = sender
-    msg["To"] = ", ".join(recipients)
-    msg.attach(MIMEText(html_body, "html"))
-
-    for fname, fbytes in attachments:
-        part = MIMEApplication(fbytes, Name=fname)
-        part["Content-Disposition"] = f'attachment; filename="{fname}"'
-        msg.attach(part)
-
-    try:
-        with smtplib.SMTP(smtp_host, smtp_port) as server:
-            if use_starttls:
-                try:
-                    server.starttls()
-                except Exception:
-                    pass
-            server.sendmail(sender, recipients, msg.as_string())
-        print("Email sent successfully!")
-    except Exception as e:
-        print(f"Error sending email: {e}")
-
-# ----------------------------
-# USAGE EXAMPLE
-# ----------------------------
-send_email_report(
-    recipients=[
-        "saisrikar.ravipati@cvshealth.com",
-        "Surendra.Koththigoda@CVSHealth.com",
-        "RadheShyam.Ramesh@CVSHealth.com",
-        "Aaron.Linnear@CVSHealth.com",
-        "Mounica.Ponnam@CVSHealth.com",
-        "Abhinanditha.Ippagunta@CVSHealth.com",
-        "KamalkumarRajeshbhai.Patel@CVSHealth.com",
-    ],
-    subject=f"QAAP Daily Regression | Integrated Tests - {cluster_name}",
-    overall_df=overall_summary_all_df,
-    summary_df=summary_all_df,
-    failed_df=fail_dfs_df,
-    parent_request_id=parent_request_id,  # <-- your variable
-    scenario_id=scenario_id,              # <-- your variable
-    lob=lob_id                            # <-- your variable (or lob)
-)
+print("Overall summary across all runs:")
+display(overall_summary_all_df)
