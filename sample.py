@@ -133,13 +133,14 @@ def build_summary_df_from_log(log_data):
 
     return df
 
-# Example usage in a later cell:
+# Example:
 # summary_df = build_summary_df_from_log(log_data)
 # display(summary_df)
 
 
-///////////////
 
+
+/////////////////////////////////////////////
 
 import pandas as pd
 import smtplib
@@ -154,10 +155,8 @@ INPUT_TABLE_NAMES = {
 }
 
 def _ensure_summary_cols(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize main numeric columns; assumes build_summary_df_from_log already did most of the work."""
     if df.empty:
         return df
-    # make sure types are numeric
     for c in ["Total_Tests", "Passed", "Failed"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
@@ -208,11 +207,15 @@ def _render_input_table(input_df: pd.DataFrame) -> str:
     """
 
 def _render_output_table(output_df: pd.DataFrame) -> str:
-    """Output tables with TOTAL row and Passed/Failed highlighting."""
+    """
+    Output tables: ONLY Table, Total_Tests, Passed, Failed
+    + TOTAL row, Passed/Failed colored.
+    """
     if output_df.empty:
         return "<p><i>No output tables.</i></p>"
 
-    df = output_df.copy()
+    # keep only needed columns
+    df = output_df[["Table", "Total_Tests", "Passed", "Failed"]].copy()
 
     total_row = {
         "Table": "TOTAL",
@@ -275,7 +278,7 @@ def _summary_df_grouped_html(summary_df: pd.DataFrame) -> str:
     For each model (uw_req_id, scenario_id, lob):
       - ID block (blue)
       - Input section: Input Report Path + input table
-      - Output section: Output Report Path + output table
+      - Output section: Output Report Path + output table (trimmed cols)
     """
     if summary_df is None or summary_df.empty:
         return "<p><i>No summary results to report.</i></p>"
@@ -351,7 +354,8 @@ def send_summary_email_grouped(
     recipients,
     subject,
     summary_df: pd.DataFrame,
-    debug_notebook_url=None,
+    debug_notebook_url_1=None,
+    debug_notebook_url_2=None,
     sender="saisrikar.ravipati@cvshealth.com",
     smtp_host="smtppaz.corp.cvscaremark.com",
     smtp_port=25,
@@ -359,21 +363,27 @@ def send_summary_email_grouped(
 ):
     grouped_html = _summary_df_grouped_html(summary_df)
 
-    debug_html = ""
-    if debug_notebook_url:
-        if debug_notebook_url.lower().startswith("http"):
-            link_html = f'<a href="{debug_notebook_url}">{debug_notebook_url}</a>'
-        else:
-            link_html = f"<code>{debug_notebook_url}</code>"
+    # Build up to two debug cards at the bottom
+    debug_html_parts = []
 
-        debug_html = f"""
+    for idx, url in enumerate([debug_notebook_url_1, debug_notebook_url_2], start=1):
+        if not url:
+            continue
+        if url.lower().startswith("http"):
+            link_html = f'<a href="{url}">{url}</a>'
+        else:
+            link_html = f"<code>{url}</code>"
+
+        debug_html_parts.append(f"""
         <div style="border:1px solid #ddd;background:#f7f7f7;
-                    padding:10px 12px;margin:14px 0 8px 0;
+                    padding:10px 12px;margin:10px 0 4px 0;
                     font-family:Arial;font-size:13px;border-radius:6px;">
-          <b>Debug Notebook (run for a model / check fail_dfs_df):</b><br/>
+          <b>Debug Notebook {idx} (run for a model / check fail_dfs_df):</b><br/>
           {link_html}
         </div>
-        """
+        """)
+
+    debug_html = "".join(debug_html_parts)
 
     html_body = f"""
     <html>
@@ -407,16 +417,19 @@ def send_summary_email_grouped(
 
 
 
-//////////////////
 
+///////////////////////////////
 
 summary_df = build_summary_df_from_log(log_data)
-display(summary_df)
 
 send_summary_email_grouped(
     recipients=[...],
     subject=f"QAAP Daily Regression | Integrated Tests - {cluster_name}",
     summary_df=summary_df,
-    debug_notebook_url="https://adb-.../notebook/..."
+    debug_notebook_url_1="https://adb-.../notebook1",
+    debug_notebook_url_2="https://adb-.../notebook2",
 )
+
+
+
 
