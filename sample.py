@@ -1,55 +1,174 @@
 import pandas as pd
+
+def build_summary_df_from_log(log_data):
+    """
+    Build a flat summary DataFrame from log_data.
+
+    Handles both input and output tables.
+    Output columns:
+      Table, Total_Tests, Passed, Failed, uw_req_id, scenario_id, lob, report_path
+    """
+
+    if not log_data:
+        return pd.DataFrame(
+            columns=["Table", "Total_Tests", "Passed", "Failed",
+                     "uw_req_id", "scenario_id", "lob", "report_path"]
+        )
+
+    summary_rows = []
+
+    # context that can change per run/model
+    ctx = {
+        "uw_req_id": None,
+        "scenario_id": None,
+        "lob": None,
+        "report_path": None,
+    }
+
+    def _get_first(d: dict, keys, default=None):
+        for k in keys:
+            if k in d and d[k] is not None:
+                return d[k]
+        return default
+
+    def _is_summary_row(d: dict) -> bool:
+        if not isinstance(d, dict):
+            return False
+        has_table = any(k in d for k in ("Table", "table"))
+        has_total = any(k in d for k in ("Total_Tests", "Total_tests", "total_tests",
+                                         "Total_test", "total_test"))
+        has_pass = any(k in d for k in ("Passed", "passed"))
+        has_fail = any(k in d for k in ("Failed", "failed"))
+        return has_table and has_total and has_pass and has_fail
+
+    def _is_ctx_row(d: dict) -> bool:
+        if not isinstance(d, dict):
+            return False
+        if _is_summary_row(d):
+            return False
+        keys = (
+            "uw_req_id", "UW_REQ_ID", "PARENT_REQUEST_ID", "parent_request_id",
+            "scenario_id", "SCENARIO_ID", "APP_ID", "app_id",
+            "lob", "LOB",
+            "report_path",
+        )
+        return any(k in d for k in keys)
+
+    for item in log_data:
+        if not isinstance(item, dict):
+            continue
+
+        # 1) update context from metadata-only rows
+        if _is_ctx_row(item):
+            uw = _get_first(item, ["uw_req_id", "UW_REQ_ID", "PARENT_REQUEST_ID", "parent_request_id"])
+            sid = _get_first(item, ["scenario_id", "SCENARIO_ID", "APP_ID", "app_id"])
+            lob = _get_first(item, ["lob", "LOB"])
+            rpt = _get_first(item, ["report_path"])
+
+            if uw is not None:
+                ctx["uw_req_id"] = uw
+            if sid is not None:
+                ctx["scenario_id"] = sid
+            if lob is not None:
+                ctx["lob"] = lob
+            if rpt is not None:
+                ctx["report_path"] = rpt
+
+        # 2) collect summary rows
+        if _is_summary_row(item):
+            row = {}
+
+            row["Table"] = _get_first(item, ["Table", "table"])
+
+            row["Total_Tests"] = _get_first(
+                item,
+                ["Total_Tests", "Total_tests", "total_tests", "Total_test", "total_test"],
+                default=0,
+            )
+            row["Passed"] = _get_first(item, ["Passed", "passed"], default=0)
+            row["Failed"] = _get_first(item, ["Failed", "failed"], default=0)
+
+            row["uw_req_id"] = _get_first(
+                item,
+                ["uw_req_id", "UW_REQ_ID", "PARENT_REQUEST_ID", "parent_request_id"],
+                default=ctx["uw_req_id"],
+            )
+            row["scenario_id"] = _get_first(
+                item,
+                ["scenario_id", "SCENARIO_ID", "APP_ID", "app_id"],
+                default=ctx["scenario_id"],
+            )
+            row["lob"] = _get_first(
+                item,
+                ["lob", "LOB"],
+                default=ctx["lob"],
+            )
+            row["report_path"] = _get_first(
+                item,
+                ["report_path"],
+                default=ctx["report_path"],
+            )
+
+            summary_rows.append(row)
+
+    df = pd.DataFrame(summary_rows)
+
+    if df.empty:
+        return pd.DataFrame(
+            columns=["Table", "Total_Tests", "Passed", "Failed",
+                     "uw_req_id", "scenario_id", "lob", "report_path"]
+        )
+
+    # numeric types
+    for c in ["Total_Tests", "Passed", "Failed"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
+
+    # ensure all columns exist
+    for c in ["uw_req_id", "scenario_id", "lob", "report_path"]:
+        if c not in df.columns:
+            df[c] = None
+
+    df = df[["Table", "Total_Tests", "Passed", "Failed",
+             "uw_req_id", "scenario_id", "lob", "report_path"]]
+
+    return df
+
+# Example usage in a later cell:
+# summary_df = build_summary_df_from_log(log_data)
+# display(summary_df)
+
+
+///////////////
+
+
+import pandas as pd
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-# -------------------------------------------------------------------
-# Config: which tables are "input"
-# -------------------------------------------------------------------
+# which table names are treated as "input" tables
 INPUT_TABLE_NAMES = {
     "SrxClaims Compare",
     "Rebate Compare",
     "Revenue Compare",
 }
 
-# -------------------------------------------------------------------
-# Helpers
-# -------------------------------------------------------------------
 def _ensure_summary_cols(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize column names to: Table, Total_Tests, Passed, Failed, uw_req_id, scenario_id, lob, report_path."""
+    """Normalize main numeric columns; assumes build_summary_df_from_log already did most of the work."""
     if df.empty:
         return df
-
-    col_map = {}
-    for c in df.columns:
-        lc = c.lower()
-        if lc == "table":
-            col_map[c] = "Table"
-        elif lc in ("total_tests", "total_test", "total_test_cnt"):
-            col_map[c] = "Total_Tests"
-        elif lc == "passed":
-            col_map[c] = "Passed"
-        elif lc == "failed":
-            col_map[c] = "Failed"
-        else:
-            col_map.setdefault(c, c)
-
-    df = df.rename(columns=col_map)
-
+    # make sure types are numeric
     for c in ["Total_Tests", "Passed", "Failed"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
-
     return df
 
-
 def _render_input_table(input_df: pd.DataFrame) -> str:
-    """Render the small input table: Table / Total_Tests / Passed / Failed / Status."""
+    """Input table: Table / Total_Tests / Passed / Failed / Status."""
     if input_df.empty:
         return "<p><i>No input tables.</i></p>"
 
     df = input_df.copy()
-    # Add Status: PASSED if Failed==0 else FAILED
     df["Status"] = df["Failed"].apply(lambda x: "PASSED" if x == 0 else "FAILED")
 
     cols = ["Table", "Total_Tests", "Passed", "Failed", "Status"]
@@ -88,15 +207,13 @@ def _render_input_table(input_df: pd.DataFrame) -> str:
     </table>
     """
 
-
 def _render_output_table(output_df: pd.DataFrame) -> str:
-    """Render output table (pnl_* etc) with TOTAL row and Passed/Failed coloring."""
+    """Output tables with TOTAL row and Passed/Failed highlighting."""
     if output_df.empty:
         return "<p><i>No output tables.</i></p>"
 
     df = output_df.copy()
 
-    # TOTAL row
     total_row = {
         "Table": "TOTAL",
         "Total_Tests": df["Total_Tests"].sum(),
@@ -153,13 +270,12 @@ def _render_output_table(output_df: pd.DataFrame) -> str:
     </table>
     """
 
-
 def _summary_df_grouped_html(summary_df: pd.DataFrame) -> str:
     """
-    Per model:
-      - blue ID card
-      - Input Report Path + input table
-      - Output Report Path + output table
+    For each model (uw_req_id, scenario_id, lob):
+      - ID block (blue)
+      - Input section: Input Report Path + input table
+      - Output section: Output Report Path + output table
     """
     if summary_df is None or summary_df.empty:
         return "<p><i>No summary results to report.</i></p>"
@@ -172,12 +288,11 @@ def _summary_df_grouped_html(summary_df: pd.DataFrame) -> str:
     blocks = []
 
     for (uw, sid, lob), g in grouped:
-        # split input vs output by table name
         input_mask = g["Table"].isin(INPUT_TABLE_NAMES)
         input_df = g[input_mask].copy()
         output_df = g[~input_mask].copy()
 
-        # ---- ID card (blue) ----
+        # ID card
         id_card = f"""
         <div style="border:1px solid #99c2ff;background:#e6f2ff;
                     padding:10px 12px;margin:14px 0 6px 0;
@@ -188,10 +303,9 @@ def _summary_df_grouped_html(summary_df: pd.DataFrame) -> str:
         </div>
         """
 
-        # ---- Input section ----
+        # Input section
         input_html = ""
         if not input_df.empty:
-            # assume same report_path for all input rows in this model
             in_path = None
             if "report_path" in input_df.columns:
                 paths = [p for p in input_df["report_path"].dropna().unique() if str(p).strip()]
@@ -207,10 +321,9 @@ def _summary_df_grouped_html(summary_df: pd.DataFrame) -> str:
                   <code>{in_path}</code>
                 </div>
                 """
-
             input_html += "<b>Input Tables</b>" + _render_input_table(input_df)
 
-        # ---- Output section ----
+        # Output section
         output_html = ""
         if not output_df.empty:
             out_path = None
@@ -228,17 +341,12 @@ def _summary_df_grouped_html(summary_df: pd.DataFrame) -> str:
                   <code>{out_path}</code>
                 </div>
                 """
-
             output_html += "<b>Output Tables</b>" + _render_output_table(output_df)
 
         blocks.append(id_card + input_html + output_html)
 
     return "".join(blocks)
 
-
-# -------------------------------------------------------------------
-# Send email
-# -------------------------------------------------------------------
 def send_summary_email_grouped(
     recipients,
     subject,
@@ -296,3 +404,19 @@ def send_summary_email_grouped(
         print("Email sent successfully!")
     except Exception as e:
         print(f"Error sending email: {e}")
+
+
+
+//////////////////
+
+
+summary_df = build_summary_df_from_log(log_data)
+display(summary_df)
+
+send_summary_email_grouped(
+    recipients=[...],
+    subject=f"QAAP Daily Regression | Integrated Tests - {cluster_name}",
+    summary_df=summary_df,
+    debug_notebook_url="https://adb-.../notebook/..."
+)
+
