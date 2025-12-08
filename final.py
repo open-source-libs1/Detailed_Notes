@@ -26,11 +26,13 @@ QSINK_PIPFILE_DIR="${ROOT_DIR}/qsink-referrals-enrollment"   # TODO: confirm thi
 QSINK_REQ="${BUILD_DIR}/requirements_qsink.txt"
 rm -f "${QSINK_REQ}"
 
-echo "[build] Generating QSink requirements from Pipfile in ${QSINK_PIPFILE_DIR}"
+echo "[build] Generating QSink requirements via pipenv in ${QSINK_PIPFILE_DIR}"
 (
   cd "${QSINK_PIPFILE_DIR}"
-  # NOTE: your pipenv version uses --requirements (long form), not -r
-  pipenv lock --requirements > "${QSINK_REQ}"
+  # This will create/use the pipenv environment defined by Pipfile,
+  # then freeze all installed packages to a requirements-style list.
+  pipenv install >/dev/null
+  pipenv run pip freeze > "${QSINK_REQ}"
 )
 
 # ----------------- Enrollment deps from root Pipfile -----------------
@@ -38,10 +40,11 @@ ENR_PIPFILE_DIR="${ROOT_DIR}"   # root Pipfile for enrollment writer
 ENR_REQ="${BUILD_DIR}/requirements_enrollment.txt"
 rm -f "${ENR_REQ}"
 
-echo "[build] Generating Enrollment requirements from Pipfile in ${ENR_PIPFILE_DIR}"
+echo "[build] Generating Enrollment requirements via pipenv in ${ENR_PIPFILE_DIR}"
 (
   cd "${ENR_PIPFILE_DIR}"
-  pipenv lock --requirements > "${ENR_REQ}"
+  pipenv install >/dev/null
+  pipenv run pip freeze > "${ENR_REQ}"
 )
 
 # ----------------- Build QSink ZIP -----------------
@@ -82,4 +85,3 @@ echo "[build] Creating Enrollment zip -> ${ENR_ZIP}"
 
 echo "[build] DONE. Artifacts in ${ARTIFACT_DIR}:"
 ls -lh "${ARTIFACT_DIR}"
-
