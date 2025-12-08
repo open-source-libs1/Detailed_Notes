@@ -1,20 +1,13 @@
 #!/bin/bash
 # build_lambdas.sh
 #
-# One-command Lambda builder for LocalStack.
-# For each Pipfile:
-#   1) pipenv install   (ensures env exists, including internal libs)
-#   2) pipenv run pip freeze -> .localstack/build/requirements_*.txt
-#   3) pipenv run python -c "import site; print(site.getsitepackages()[0])"
-#      to locate the env's site-packages
-#   4) copy site-packages into build dir
-#   5) copy lambda source + zip
-#
-# Outputs:
-#   .localstack/artifacts/qsink_forwarder_lambda.zip
-#   .localstack/artifacts/enrollment_writer_lambda.zip
-#   .localstack/build/requirements_qsink.txt
-#   .localstack/build/requirements_enrollment.txt
+# One-command Lambda builder for LocalStack, no site-packages hacks.
+# For each lambda:
+#   1) pipenv install  (uses Pipfile/Pipfile.lock)
+#   2) pipenv run pip freeze -> .localstack/build/requirements_<name>.txt
+#   3) pipenv run python -m pip install -r requirements_<name>.txt -t <build_dir>
+#   4) copy lambda source into <build_dir>
+#   5) zip -> .localstack/artifacts/<name>_lambda.zip
 
 set -euo pipefail
 
@@ -30,42 +23,44 @@ echo "  BUILDING LAMBDA ZIPS"
 echo "=========================="
 echo ""
 
-# Helper: ensure pipenv env exists for a Pipfile dir, write requirements into
-# .localstack/build, and return that env's site-packages path.
-build_env_and_get_sitepkgs() {
-  local pipfile_dir="$1"     # directory containing Pipfile
-  local req_out="$2"         # requirements file path under .localstack/build
+PYTHON_BIN="${PYTHON_BIN:-python3.12}"
 
+# Helper: runs inside a Pipfile directory
+generate_requirements() {
+  local pipfile_dir="$1"
+  local req_out="$2"
   (
     set -euo pipefail
     cd "${pipfile_dir}"
-
-    echo "[env][$(basename "${pipfile_dir}")] pipenv install..."
+    echo "[req][$(basename "${pipfile_dir}")] pipenv install..."
     pipenv install >/dev/null
 
-    echo "[env][$(basename "${pipfile_dir}")] freezing -> ${req_out}"
+    echo "[req][$(basename "${pipfile_dir}")] freezing -> ${req_out}"
     pipenv run pip freeze > "${req_out}"
-
-    echo "[env][$(basename "${pipfile_dir}")] locating site-packages..."
-    local sitepkg
-    sitepkg=$(pipenv run python - << 'PY'
-import site
-paths = site.getsitepackages()
-if not paths:
-    raise SystemExit("No site-packages found via site.getsitepackages()")
-print(paths[0])
-PY
-    )
-    echo "[env][$(basename "${pipfile_dir}")] site-packages: ${sitepkg}"
-    echo "${sitepkg}"
   )
 }
 
-# Generic builder for one lambda
+# Helper: install deps from requirements into target dir using the SAME pipenv env
+install_deps_with_pipenv() {
+  local pipfile_dir="$1"
+  local req_file="$2"
+  local target_dir="$3"
+  (
+    set -euo pipefail
+    cd "${pipfile_dir}"
+    echo "[deps][$(basename "${pipfile_dir}")] installing from ${req_file} into ${target_dir}"
+    # IMPORTANT: use pipenv's python/pip so it has the same internal index config
+    pipenv run "${PYTHON_BIN}" -m pip install \
+      --upgrade \
+      --target "${target_dir}" \
+      -r "${req_file}"
+  )
+}
+
 build_lambda() {
-  local name="$1"            # e.g. "qsink" or "enrollment"
-  local pipfile_dir="$2"     # where Pipfile lives
-  local src_dir="$3"         # where lambda code (handler.py, utils, etc.) lives
+  local name="$1"        # "qsink" or "enrollment"
+  local pipfile_dir="$2" # where Pipfile lives
+  local src_dir="$3"     # where handler.py & code live
 
   local req_file="${BUILD_DIR}/requirements_${name}.txt"
   local build_subdir="${BUILD_DIR}/${name}_lambda"
@@ -77,19 +72,17 @@ build_lambda() {
   rm -rf "${build_subdir}"
   mkdir -p "${build_subdir}"
 
-  # 1) Ensure env + get site-packages; write requirements_* to .localstack/build
-  local sitepkg
-  sitepkg=$(build_env_and_get_sitepkgs "${pipfile_dir}" "${req_file}")
+  # 1) generate requirements_<name>.txt in .localstack/build
+  generate_requirements "${pipfile_dir}" "${req_file}"
 
-  # 2) Copy installed packages into build dir
-  echo "[${name}] copying site-packages from ${sitepkg} -> ${build_subdir}"
-  cp -R "${sitepkg}/." "${build_subdir}/"
+  # 2) install deps into build_subdir using pipenv's pip
+  install_deps_with_pipenv "${pipfile_dir}" "${req_file}" "${build_subdir}"
 
-  # 3) Copy lambda source
+  # 3) copy source
   echo "[${name}] copying source from ${src_dir}"
   cp -R "${src_dir}/." "${build_subdir}/"
 
-  # 4) Zip
+  # 4) zip
   echo "[${name}] creating zip -> ${zip_path}"
   ( cd "${build_subdir}" && zip -r "${zip_path}" . >/dev/null )
 
@@ -97,15 +90,15 @@ build_lambda() {
 }
 
 # ----------------- QSink Forwarder Lambda -----------------
-# TODO: confirm QSINK_SRC points to the folder that has handler.py for QSink
+# TODO: confirm QSINK_SRC points to folder housing QSink lambda handler (e.g. handler.py)
 QSINK_PIPFILE_DIR="${ROOT_DIR}/qsink-referrals-enrollment"
 QSINK_SRC="${ROOT_DIR}/qsink-referrals-enrollment/src"
 
 build_lambda "qsink" "${QSINK_PIPFILE_DIR}" "${QSINK_SRC}"
 
 # ----------------- Enrollment Writer Lambda -----------------
-# TODO: confirm ENR_SRC points to the folder that has handler.py for Enrollment Writer
-ENR_PIPFILE_DIR="${ROOT_DIR}"                      # root Pipfile
+# TODO: confirm ENR_SRC points to folder housing Enrollment Writer handler
+ENR_PIPFILE_DIR="${ROOT_DIR}"                     # root Pipfile
 ENR_SRC="${ROOT_DIR}/enrollment_writer/app"
 
 build_lambda "enrollment" "${ENR_PIPFILE_DIR}" "${ENR_SRC}"
