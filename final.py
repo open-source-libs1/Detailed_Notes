@@ -2,48 +2,50 @@
 #
 # build_lambdas.sh
 #
-# Purpose
-# -------
-# Build Lambda deployment ZIPs for running the enrollment stack against LocalStack.
+# Build Lambda deployment ZIPs for LocalStack.
+#
 # We have two Python Lambdas:
 #   1) QSink Forwarder      (qsink-referrals-enrollment)
 #   2) Enrollment Writer    (enrollment_writer)
 #
-# Each Lambda uses Pipenv for dependency management. We *reuse* those Pipenv
-# virtualenvs to avoid re-resolving internal/private packages (e.g. c1-*
-# libraries) that may only be available from internal indexes.
+# Both use Pipenv. To avoid all the issues with re-installing internal
+# packages (like c1-referralplatform-awsutil) into a separate target
+# directory, we:
 #
-# High-level flow for each Lambda:
-#   - Ensure its Pipenv environment is created and up to date (`pipenv install`).
-#   - Freeze its environment to a requirements_<name>.txt (for traceability).
-#   - Locate the Pipenv virtualenv and its site-packages directory.
-#   - Copy site-packages (all installed deps) into a Lambda build directory.
-#   - Copy the Lambda's application source into the same directory.
-#   - Zip the directory into .localstack/artifacts/<name>_lambda.zip.
+#   - Reuse the existing Pipenv virtualenvs.
+#   - Copy their site-packages into a Lambda build dir.
+#   - Copy the lambda source on top.
+#   - Zip the result.
 #
-# This script is intentionally idempotent: rerunning it will rebuild both ZIPs
-# from scratch, overwriting any previous artifacts.
+# This is exactly equivalent to:
+#   pipenv install
+#   VENV=$(pipenv --venv)
+#   SITEPKG=$(ls -d "$VENV"/lib/python*/site-packages)
+#   cp -R "$SITEPKG"/. build_dir/
+#   cp -R src/. build_dir/
+#   zip -r lambda.zip build_dir
 #
+# which you have already validated works on your machine.
 
 set -euo pipefail
 
-########################################
-# Repo-relative paths / configuration #
-########################################
+#############################
+# Repo paths / configuration
+#############################
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ARTIFACT_DIR="${ROOT_DIR}/.localstack/artifacts"
 BUILD_DIR="${ROOT_DIR}/.localstack/build"
 
 # QSink Forwarder Lambda
-QSINK_PIPFILE_DIR="${ROOT_DIR}/qsink-referrals-enrollment"     # Pipfile location
-QSINK_SRC_DIR="${ROOT_DIR}/qsink-referrals-enrollment/src"     # Lambda source (handler.py, etc.)
 QSINK_NAME="qsink_forwarder"
+QSINK_PIPFILE_DIR="${ROOT_DIR}/qsink-referrals-enrollment"   # Pipfile location
+QSINK_SRC_DIR="${ROOT_DIR}/qsink-referrals-enrollment/src"   # Lambda code (handler.py etc.)
 
 # Enrollment Writer Lambda
-ENR_PIPFILE_DIR="${ROOT_DIR}"                                  # Root Pipfile
-ENR_SRC_DIR="${ROOT_DIR}/enrollment_writer/app"                # Lambda source
 ENR_NAME="enrollment_writer"
+ENR_PIPFILE_DIR="${ROOT_DIR}"                                # Root Pipfile
+ENR_SRC_DIR="${ROOT_DIR}/enrollment_writer/app"              # Lambda code
 
 mkdir -p "${ARTIFACT_DIR}" "${BUILD_DIR}"
 
@@ -51,82 +53,29 @@ echo ""
 echo "=========================="
 echo "  BUILDING LAMBDA ZIPS"
 echo "=========================="
-echo "ROOT_DIR       = ${ROOT_DIR}"
-echo "ARTIFACT_DIR   = ${ARTIFACT_DIR}"
-echo "BUILD_DIR      = ${BUILD_DIR}"
+echo "ROOT_DIR     = ${ROOT_DIR}"
+echo "ARTIFACT_DIR = ${ARTIFACT_DIR}"
+echo "BUILD_DIR    = ${BUILD_DIR}"
 echo ""
 
-########################################
-# Helper: resolve site-packages for a #
-# Pipenv environment                  #
-########################################
-# Given a directory containing a Pipfile, this function:
-#   - ensures the Pipenv env exists (`pipenv install`)
-#   - writes a requirements_<name>.txt under .localstack/build
-#   - returns the absolute path to that env's site-packages directory
+#####################################
+# Helper: build a single Lambda ZIP #
+#####################################
+# Args:
+#   $1 = logical name       (for logs + filenames)
+#   $2 = Pipfile directory  (where Pipfile lives)
+#   $3 = source directory   (where handler.py & code live)
 #
-# We call Python *inside* the Pipenv env (`pipenv run python`) so paths are
-# resolved against the correct virtualenv, not the system interpreter.
-
-prepare_env_and_get_sitepkgs() {
-  local pipfile_dir="$1"      # directory containing Pipfile
-  local req_out="$2"          # path to requirements_<name>.txt
-  local label="$3"            # human-friendly label for logging
-
-  (
-    set -euo pipefail
-    cd "${pipfile_dir}"
-
-    echo "[env][${label}] Running 'pipenv install' to ensure environment..."
-    pipenv install >/dev/null
-
-    echo "[env][${label}] Freezing environment -> ${req_out}"
-    pipenv run pip freeze > "${req_out}"
-
-    echo "[env][${label}] Resolving site-packages via 'pipenv run python'..."
-    # We prefer sysconfig['purelib'], but also fall back to site.getsitepackages()
-    local sitepkg
-    sitepkg="$(
-      pipenv run python - << 'PY'
-import os
-import sysconfig
-import site
-
-candidates = []
-
-purelib = sysconfig.get_paths().get("purelib")
-if purelib:
-    candidates.append(purelib)
-
-for p in site.getsitepackages():
-    candidates.append(p)
-
-for path in candidates:
-    if path and os.path.isdir(path):
-        print(path)
-        break
-PY
-    )"
-
-    if [ -z "${sitepkg}" ] || [ ! -d "${sitepkg}" ]; then
-      echo "[env][${label}] ERROR: Could not resolve site-packages directory." >&2
-      echo "[env][${label}]       Run 'pipenv --venv' and inspect <venv>/lib/python*/site-packages." >&2
-      exit 1
-    fi
-
-    echo "[env][${label}] Using site-packages: ${sitepkg}"
-    # Echo site-packages path back to caller
-    echo "${sitepkg}"
-  )
-}
-
-########################################
-# Helper: build one Lambda artifact   #
-########################################
-# Arguments:
-#   $1 = logical lambda name (for logging / filenames)
-#   $2 = Pipfile directory for this lambda
-#   $3 = source directory (code to copy into zip)
+# Steps:
+#   - Clean build dir
+#   - In Pipfile dir:
+#       * pipenv install
+#       * pipenv run pip freeze -> .localstack/build/requirements_<name>.txt
+#       * VENV=$(pipenv --venv)
+#       * SITEPKG=$(ls -d "$VENV"/lib/python*/site-packages | head -1)
+#       * cp site-packages -> build dir
+#   - Copy source into build dir
+#   - Zip build dir into .localstack/artifacts/<name>.zip
 
 build_lambda() {
   local name="$1"
@@ -135,7 +84,7 @@ build_lambda() {
 
   local build_subdir="${BUILD_DIR}/${name}_lambda"
   local req_file="${BUILD_DIR}/requirements_${name}.txt"
-  local zip_path="${ARTIFACT_DIR}/${name}_lambda.zip"
+  local zip_path="${ARTIFACT_DIR}/${name}.zip"
 
   echo ""
   echo "=== Building '${name}' lambda ==="
@@ -144,48 +93,68 @@ build_lambda() {
   echo "[${name}] Build dir    : ${build_subdir}"
   echo "[${name}] Artifact     : ${zip_path}"
 
-  # Clean build directory to avoid stale files between runs
   rm -rf "${build_subdir}"
   mkdir -p "${build_subdir}"
 
-  # 1) Ensure Pipenv env, write requirements_<name>.txt, and get site-packages path
-  local sitepkg
-  sitepkg="$(prepare_env_and_get_sitepkgs "${pipfile_dir}" "${req_file}" "${name}")"
+  # Do all env-related work inside the Pipfile directory
+  (
+    set -euo pipefail
+    cd "${pipfile_dir}"
 
-  # 2) Copy all installed dependencies into the build directory
-  #    This effectively "vendorizes" the env's site-packages for Lambda.
-  echo "[${name}] Copying dependencies from site-packages -> build dir..."
-  cp -R "${sitepkg}/." "${build_subdir}/"
+    echo "[${name}] pipenv install (ensuring env is up to date)..."
+    pipenv install >/dev/null
 
-  # 3) Copy the lambda's application code on top of the dependencies
-  echo "[${name}] Copying lambda source -> build dir..."
+    echo "[${name}] Freezing env -> ${req_file}"
+    pipenv run pip freeze > "${req_file}"
+
+    echo "[${name}] Resolving virtualenv path via 'pipenv --venv'..."
+    VENV_DIR="$(pipenv --venv)"
+    echo "[${name}] VENV_DIR = ${VENV_DIR}"
+
+    echo "[${name}] Locating site-packages under \${VENV_DIR}/lib..."
+    # This mirrors the manual commands you already ran:
+    #   ls "$VENV"/lib
+    #   ls -d "$VENV"/lib/python*/site-packages
+    SITEPKG_CANDIDATE=$(ls -d "${VENV_DIR}"/lib/python*/site-packages 2>/dev/null | head -1 || true)
+
+    if [[ -z "${SITEPKG_CANDIDATE}" || ! -d "${SITEPKG_CANDIDATE}" ]]; then
+      echo "[${name}] ERROR: Could not find site-packages under ${VENV_DIR}/lib/python*/site-packages" >&2
+      echo "[${name}]        Run these manually to debug:" >&2
+      echo "[${name}]          cd ${pipfile_dir}" >&2
+      echo "[${name}]          VENV=\$(pipenv --venv)" >&2
+      echo "[${name}]          ls \"\$VENV\"/lib" >&2
+      echo "[${name}]          ls -d \"\$VENV\"/lib/python*/site-packages" >&2
+      exit 1
+    fi
+
+    echo "[${name}] Using site-packages: ${SITEPKG_CANDIDATE}"
+    echo "[${name}] Copying dependencies -> ${build_subdir}"
+    cp -R "${SITEPKG_CANDIDATE}/." "${build_subdir}/"
+  )
+
+  echo "[${name}] Copying lambda source -> ${build_subdir}"
   cp -R "${src_dir}/." "${build_subdir}/"
 
-  # 4) Zip the build directory into an artifact
-  echo "[${name}] Creating deployment zip..."
+  echo "[${name}] Creating deployment zip -> ${zip_path}"
   (
     cd "${build_subdir}"
     zip -r "${zip_path}" . >/dev/null
   )
 
-  echo "[${name}] DONE: ${zip_path}"
+  echo "[${name}] DONE"
 }
 
-##########################
-# Build both Lambdas    #
-##########################
+###############################
+# Build both lambda artifacts #
+###############################
 
-# QSink Forwarder (QSync → Enrollment queue)
 build_lambda "${QSINK_NAME}" "${QSINK_PIPFILE_DIR}" "${QSINK_SRC_DIR}"
-
-# Enrollment Writer (Enrollment SQS → Aurora DB writer)
-build_lambda "${ENR_NAME}" "${ENR_PIPFILE_DIR}" "${ENR_SRC_DIR}"
+build_lambda "${ENR_NAME}"   "${ENR_PIPFILE_DIR}"   "${ENR_SRC_DIR}"
 
 echo ""
 echo "=========================="
 echo "  BUILD COMPLETE"
 echo "=========================="
-echo "Artifacts in ${ARTIFACT_DIR}:"
 ls -lh "${ARTIFACT_DIR}" || true
 echo ""
 echo "Requirements snapshots in ${BUILD_DIR}:"
