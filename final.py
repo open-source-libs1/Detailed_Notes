@@ -2,16 +2,19 @@
 # build_lambdas.sh
 #
 # One-command Lambda builder for LocalStack.
-# Automates:
-#   ✔ pipenv install (for both projects)
-#   ✔ pipenv freeze > requirements.txt
-#   ✔ pip install --target <build> -r requirements.txt
-#   ✔ copy source code
-#   ✔ create zip artifacts
+# For each Pipfile:
+#   1) pipenv install   (ensures env exists, including internal libs)
+#   2) pipenv run pip freeze -> .localstack/build/requirements_*.txt
+#   3) pipenv run python -c "import site; print(site.getsitepackages()[0])"
+#      to locate the env's site-packages
+#   4) copy site-packages into build dir
+#   5) copy lambda source + zip
 #
 # Outputs:
 #   .localstack/artifacts/qsink_forwarder_lambda.zip
 #   .localstack/artifacts/enrollment_writer_lambda.zip
+#   .localstack/build/requirements_qsink.txt
+#   .localstack/build/requirements_enrollment.txt
 
 set -euo pipefail
 
@@ -27,111 +30,93 @@ echo "  BUILDING LAMBDA ZIPS"
 echo "=========================="
 echo ""
 
-PYTHON_BIN="${PYTHON_BIN:-python3.12}"
+# Helper: ensure pipenv env exists for a Pipfile dir, write requirements into
+# .localstack/build, and return that env's site-packages path.
+build_env_and_get_sitepkgs() {
+  local pipfile_dir="$1"     # directory containing Pipfile
+  local req_out="$2"         # requirements file path under .localstack/build
 
-#
-# Helper function to:
-#   1. pipenv install
-#   2. pipenv freeze -> requirements
-#
-generate_requirements() {
-  local pipfile_dir="$1"
-  local output_req_file="$2"
-
-  echo ""
-  echo "[req] Generating requirements for: ${pipfile_dir}"
   (
+    set -euo pipefail
     cd "${pipfile_dir}"
-    echo "[req] Running pipenv install..."
+
+    echo "[env][$(basename "${pipfile_dir}")] pipenv install..."
     pipenv install >/dev/null
 
-    echo "[req] Freezing environment -> ${output_req_file}"
-    pipenv run pip freeze > "${output_req_file}"
+    echo "[env][$(basename "${pipfile_dir}")] freezing -> ${req_out}"
+    pipenv run pip freeze > "${req_out}"
+
+    echo "[env][$(basename "${pipfile_dir}")] locating site-packages..."
+    local sitepkg
+    sitepkg=$(pipenv run python - << 'PY'
+import site
+paths = site.getsitepackages()
+if not paths:
+    raise SystemExit("No site-packages found via site.getsitepackages()")
+print(paths[0])
+PY
+    )
+    echo "[env][$(basename "${pipfile_dir}")] site-packages: ${sitepkg}"
+    echo "${sitepkg}"
   )
 }
 
-#
-# Helper to install dependencies into Lambda build dir.
-#
-install_deps() {
-  local req_file="$1"
-  local target_dir="$2"
+# Generic builder for one lambda
+build_lambda() {
+  local name="$1"            # e.g. "qsink" or "enrollment"
+  local pipfile_dir="$2"     # where Pipfile lives
+  local src_dir="$3"         # where lambda code (handler.py, utils, etc.) lives
+
+  local req_file="${BUILD_DIR}/requirements_${name}.txt"
+  local build_subdir="${BUILD_DIR}/${name}_lambda"
+  local zip_path="${ARTIFACT_DIR}/${name}_lambda.zip"
 
   echo ""
-  echo "[deps] Installing deps from ${req_file} into ${target_dir}"
+  echo "=== Building ${name} lambda ==="
 
-  "${PYTHON_BIN}" -m pip install \
-    --platform manylinux2014_x86_64 \
-    --implementation cp \
-    --python-version 3.12 \
-    --target "${target_dir}" \
-    --upgrade \
-    -r "${req_file}"
+  rm -rf "${build_subdir}"
+  mkdir -p "${build_subdir}"
+
+  # 1) Ensure env + get site-packages; write requirements_* to .localstack/build
+  local sitepkg
+  sitepkg=$(build_env_and_get_sitepkgs "${pipfile_dir}" "${req_file}")
+
+  # 2) Copy installed packages into build dir
+  echo "[${name}] copying site-packages from ${sitepkg} -> ${build_subdir}"
+  cp -R "${sitepkg}/." "${build_subdir}/"
+
+  # 3) Copy lambda source
+  echo "[${name}] copying source from ${src_dir}"
+  cp -R "${src_dir}/." "${build_subdir}/"
+
+  # 4) Zip
+  echo "[${name}] creating zip -> ${zip_path}"
+  ( cd "${build_subdir}" && zip -r "${zip_path}" . >/dev/null )
+
+  echo "[${name}] DONE"
 }
 
-#
-# -------------------------------
-#    QSink Forwarder Lambda
-# -------------------------------
-#
+# ----------------- QSink Forwarder Lambda -----------------
+# TODO: confirm QSINK_SRC points to the folder that has handler.py for QSink
+QSINK_PIPFILE_DIR="${ROOT_DIR}/qsink-referrals-enrollment"
+QSINK_SRC="${ROOT_DIR}/qsink-referrals-enrollment/src"
 
-QSINK_DIR="${ROOT_DIR}/qsink-referrals-enrollment"
-QSINK_REQ="${QSINK_DIR}/requirements_lambda.txt"
-QSINK_SRC="${QSINK_DIR}/src"               # TODO confirm handler path
-QSINK_BUILD="${BUILD_DIR}/qsink_forwarder"
-QSINK_ZIP="${ARTIFACT_DIR}/qsink_forwarder_lambda.zip"
+build_lambda "qsink" "${QSINK_PIPFILE_DIR}" "${QSINK_SRC}"
 
-rm -rf "${QSINK_BUILD}"
-mkdir -p "${QSINK_BUILD}"
+# ----------------- Enrollment Writer Lambda -----------------
+# TODO: confirm ENR_SRC points to the folder that has handler.py for Enrollment Writer
+ENR_PIPFILE_DIR="${ROOT_DIR}"                      # root Pipfile
+ENR_SRC="${ROOT_DIR}/enrollment_writer/app"
 
-echo ""
-echo "=== Building QSink Forwarder Lambda ==="
+build_lambda "enrollment" "${ENR_PIPFILE_DIR}" "${ENR_SRC}"
 
-generate_requirements "${QSINK_DIR}" "${QSINK_REQ}"
-install_deps "${QSINK_REQ}" "${QSINK_BUILD}"
-
-echo "[qsink] Copying source code..."
-cp -R "${QSINK_SRC}/." "${QSINK_BUILD}/"
-
-echo "[qsink] Creating lambda zip -> ${QSINK_ZIP}"
-( cd "${QSINK_BUILD}" && zip -r "${QSINK_ZIP}" . >/dev/null )
-
-
-#
-# -------------------------------
-#    Enrollment Writer Lambda
-# -------------------------------
-#
-
-ENR_DIR="${ROOT_DIR}"                       # root Pipfile
-ENR_REQ="${ROOT_DIR}/requirements_enrollment_lambda.txt"
-ENR_SRC="${ROOT_DIR}/enrollment_writer/app" # TODO confirm handler path
-ENR_BUILD="${BUILD_DIR}/enrollment_writer"
-ENR_ZIP="${ARTIFACT_DIR}/enrollment_writer_lambda.zip"
-
-rm -rf "${ENR_BUILD}"
-mkdir -p "${ENR_BUILD}"
-
-echo ""
-echo "=== Building Enrollment Writer Lambda ==="
-
-generate_requirements "${ENR_DIR}" "${ENR_REQ}"
-install_deps "${ENR_REQ}" "${ENR_BUILD}"
-
-echo "[enrollment] Copying source code..."
-cp -R "${ENR_SRC}/." "${ENR_BUILD}/"
-
-echo "[enrollment] Creating lambda zip -> ${ENR_ZIP}"
-( cd "${ENR_BUILD}" && zip -r "${ENR_ZIP}" . >/dev/null )
-
-
-#
-# Done
-#
 echo ""
 echo "=========================="
-echo "   BUILD COMPLETE"
+echo "  BUILD COMPLETE"
 echo "=========================="
-echo "Artifacts:"
+echo "Artifacts in ${ARTIFACT_DIR}:"
 ls -lh "${ARTIFACT_DIR}"
+echo ""
+echo "Requirements in ${BUILD_DIR}:"
+ls -lh "${BUILD_DIR}"/requirements_*.txt || true
 echo ""
