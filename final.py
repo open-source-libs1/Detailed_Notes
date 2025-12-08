@@ -17,70 +17,72 @@ BUILD_DIR="${ROOT_DIR}/.localstack/build"
 
 mkdir -p "${ARTIFACT_DIR}" "${BUILD_DIR}"
 
-PYTHON_BIN="${PYTHON_BIN:-python3.12}"
-
-echo "[build] Using Python: ${PYTHON_BIN}"
+echo "[build] Root dir: ${ROOT_DIR}"
+echo "[build] Artifacts dir: ${ARTIFACT_DIR}"
+echo "[build] Build dir: ${BUILD_DIR}"
 
 # ----------------- QSink deps from its own Pipfile -----------------
 QSINK_PIPFILE_DIR="${ROOT_DIR}/qsink-referrals-enrollment"   # TODO: confirm this path
 QSINK_REQ="${BUILD_DIR}/requirements_qsink.txt"
-rm -f "${QSINK_REQ}"
-
-echo "[build] Generating QSink requirements via pipenv in ${QSINK_PIPFILE_DIR}"
-(
-  cd "${QSINK_PIPFILE_DIR}"
-  # This will create/use the pipenv environment defined by Pipfile,
-  # then freeze all installed packages to a requirements-style list.
-  pipenv install >/dev/null
-  pipenv run pip freeze > "${QSINK_REQ}"
-)
-
-# ----------------- Enrollment deps from root Pipfile -----------------
-ENR_PIPFILE_DIR="${ROOT_DIR}"   # root Pipfile for enrollment writer
-ENR_REQ="${BUILD_DIR}/requirements_enrollment.txt"
-rm -f "${ENR_REQ}"
-
-echo "[build] Generating Enrollment requirements via pipenv in ${ENR_PIPFILE_DIR}"
-(
-  cd "${ENR_PIPFILE_DIR}"
-  pipenv install >/dev/null
-  pipenv run pip freeze > "${ENR_REQ}"
-)
-
-# ----------------- Build QSink ZIP -----------------
-# TODO: set this to the directory where your QSink lambda code (handler.py etc.) lives.
-QSINK_SRC="${ROOT_DIR}/qsink-referrals-enrollment/src"
 QSINK_BUILD="${BUILD_DIR}/qsink_forwarder"
 QSINK_ZIP="${ARTIFACT_DIR}/qsink_forwarder_lambda.zip"
+
+# TODO: set this to the directory where your QSink lambda code (handler.py etc.) lives
+QSINK_SRC="${ROOT_DIR}/qsink-referrals-enrollment/src"
 
 rm -rf "${QSINK_BUILD}"
 mkdir -p "${QSINK_BUILD}"
 
-echo "[build] Installing QSink deps into ${QSINK_BUILD}"
-"${PYTHON_BIN}" -m pip install -r "${QSINK_REQ}" -t "${QSINK_BUILD}"
+echo "[build] === QSink: using Pipfile at ${QSINK_PIPFILE_DIR} ==="
+(
+  cd "${QSINK_PIPFILE_DIR}"
+  echo "[build][QSink] Ensuring pipenv environment is installed..."
+  pipenv install >/dev/null
 
-echo "[build] Copying QSink source from ${QSINK_SRC}"
+  echo "[build][QSink] Freezing deps from pipenv env -> ${QSINK_REQ}"
+  pipenv run pip freeze > "${QSINK_REQ}"
+
+  echo "[build][QSink] Installing deps from pipenv env into ${QSINK_BUILD}"
+  # IMPORTANT: use pipenv's pip, so it can see internal indexes (c1-* packages etc.)
+  pipenv run pip install -r "${QSINK_REQ}" -t "${QSINK_BUILD}"
+)
+
+echo "[build][QSink] Copying source from ${QSINK_SRC}"
 cp -R "${QSINK_SRC}/." "${QSINK_BUILD}/"
 
-echo "[build] Creating QSink zip -> ${QSINK_ZIP}"
+echo "[build][QSink] Creating zip -> ${QSINK_ZIP}"
 ( cd "${QSINK_BUILD}" && zip -r "${QSINK_ZIP}" . >/dev/null )
 
-# ----------------- Build Enrollment Writer ZIP -----------------
-# TODO: set this to the directory where your Enrollment Writer lambda code lives.
-ENR_SRC="${ROOT_DIR}/enrollment_writer/app"
+
+# ----------------- Enrollment Writer deps from root Pipfile -----------------
+ENR_PIPFILE_DIR="${ROOT_DIR}"   # main Pipfile at repo root
+ENR_REQ="${BUILD_DIR}/requirements_enrollment.txt"
 ENR_BUILD="${BUILD_DIR}/enrollment_writer"
 ENR_ZIP="${ARTIFACT_DIR}/enrollment_writer_lambda.zip"
+
+# TODO: set this to the directory where your Enrollment Writer lambda code lives
+ENR_SRC="${ROOT_DIR}/enrollment_writer/app"
 
 rm -rf "${ENR_BUILD}"
 mkdir -p "${ENR_BUILD}"
 
-echo "[build] Installing Enrollment deps into ${ENR_BUILD}"
-"${PYTHON_BIN}" -m pip install -r "${ENR_REQ}" -t "${ENR_BUILD}"
+echo "[build] === Enrollment: using Pipfile at ${ENR_PIPFILE_DIR} ==="
+(
+  cd "${ENR_PIPFILE_DIR}"
+  echo "[build][Enrollment] Ensuring pipenv environment is installed..."
+  pipenv install >/dev/null
 
-echo "[build] Copying Enrollment source from ${ENR_SRC}"
+  echo "[build][Enrollment] Freezing deps from pipenv env -> ${ENR_REQ}"
+  pipenv run pip freeze > "${ENR_REQ}"
+
+  echo "[build][Enrollment] Installing deps from pipenv env into ${ENR_BUILD}"
+  pipenv run pip install -r "${ENR_REQ}" -t "${ENR_BUILD}"
+)
+
+echo "[build][Enrollment] Copying source from ${ENR_SRC}"
 cp -R "${ENR_SRC}/." "${ENR_BUILD}/"
 
-echo "[build] Creating Enrollment zip -> ${ENR_ZIP}"
+echo "[build][Enrollment] Creating zip -> ${ENR_ZIP}"
 ( cd "${ENR_BUILD}" && zip -r "${ENR_ZIP}" . >/dev/null )
 
 echo "[build] DONE. Artifacts in ${ARTIFACT_DIR}:"
