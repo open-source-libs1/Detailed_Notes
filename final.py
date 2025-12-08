@@ -1,11 +1,12 @@
 #!/bin/bash
 # build_lambdas.sh
 #
-# One-command Lambda builder for LocalStack, no site-packages hacks.
-# For each lambda:
+# One-command Lambda builder for LocalStack.
+#
+# For each lambda (qsink + enrollment):
 #   1) pipenv install  (uses Pipfile/Pipfile.lock)
 #   2) pipenv run pip freeze -> .localstack/build/requirements_<name>.txt
-#   3) pipenv run python -m pip install -r requirements_<name>.txt -t <build_dir>
+#   3) pipenv run pip install -r requirements_<name>.txt -t <build_dir>
 #   4) copy lambda source into <build_dir>
 #   5) zip -> .localstack/artifacts/<name>_lambda.zip
 
@@ -23,9 +24,7 @@ echo "  BUILDING LAMBDA ZIPS"
 echo "=========================="
 echo ""
 
-PYTHON_BIN="${PYTHON_BIN:-python3.12}"
-
-# Helper: runs inside a Pipfile directory
+# Helper: runs inside a Pipfile directory, ensures env and writes requirements
 generate_requirements() {
   local pipfile_dir="$1"
   local req_out="$2"
@@ -49,8 +48,8 @@ install_deps_with_pipenv() {
     set -euo pipefail
     cd "${pipfile_dir}"
     echo "[deps][$(basename "${pipfile_dir}")] installing from ${req_file} into ${target_dir}"
-    # IMPORTANT: use pipenv's python/pip so it has the same internal index config
-    pipenv run "${PYTHON_BIN}" -m pip install \
+    # IMPORTANT: use pipenv's pip directly (matches your manual working command)
+    pipenv run pip install \
       --upgrade \
       --target "${target_dir}" \
       -r "${req_file}"
