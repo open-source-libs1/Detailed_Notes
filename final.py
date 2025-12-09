@@ -50,3 +50,16 @@ services:
       - ./lambda_bundles:/opt/lambda_bundles
 
     restart: unless-stopped
+
+
+
+
+////////////////////////
+
+
+docker info >/dev/null 2>&1 && echo "Docker OK" || echo "Docker NOT running"
+ls -l /var/run/docker.sock
+
+
+
+
