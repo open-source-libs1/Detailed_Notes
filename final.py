@@ -15,64 +15,23 @@ AWS_DEFAULT_REGION=us-east-1
 AWS_ENDPOINT_URL=http://localhost:4566
 
 ############################################
-# Local resource names
+# Local resource names (match bootstrap)
 ############################################
 QSINK_BUCKET_NAME=qsink-bucket-local
 QSINK_QUEUE_NAME=sqsq1
 ENROLLMENT_QUEUE_NAME=sqsq2
 
 ############################################
-# OPTIONAL Proxy (only if required)
+# LocalStack Pro license
 ############################################
-HTTPS_PROXY=
-HTTP_PROXY=
-NO_PROXY=localhost,127.0.0.1,localstack
+# Paste the token from app.localstack.cloud here:
+LOCALSTACK_AUTH_TOKEN=ls-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
-
-
-
-
-
-//////////////////////////
-
-
-version: "3.9"
-
-services:
-  localstack:
-    image: localstack/localstack:3.6
-    container_name: localstack
-
-    ports:
-      - "4566:4566"
-      - "4510-4559:4510-4559"
-
-    environment:
-      - SERVICES=s3,sqs,lambda
-      - DEBUG=1
-      - AWS_DEFAULT_REGION=us-east-1
-
-      # Important: allow LocalStack to start Lambda containers
-      - DOCKER_HOST=unix:///var/run/docker.sock
-
-      # Where the bootstrap script reads .env
-      - LOCALSTACK_HOST=localstack
-      - HOSTNAME_EXTERNAL=localstack
-
-    volumes:
-      # Allow LocalStack to start Lambda docker containers
-      - /var/run/docker.sock:/var/run/docker.sock
-
-      # Bootstrap script for S3/SQS/Lambda setup
-      - ./localstack_bootstrap.sh:/etc/localstack/init/ready.d/00-bootstrap.sh:ro
-
-      # Pass .env from host → container so bootstrap can read DB + queue names
-      - ./.env:/project/.env:ro
-
-      # Lambda ZIPs (required if bootstrap deploys Lambda functions)
-      - ./.localstack/artifacts:/artifacts:ro
-
-    restart: unless-stopped
-
-
-
+############################################
+# Corporate proxy (for license + pulling images)
+# Fill these in with your real proxy URLs/ports.
+# If you don't need a proxy, leave them blank.
+############################################
+HTTPS_PROXY=http://your-proxy-host:port
+HTTP_PROXY=http://your-proxy-host:port
+NO_PROXY=localhost,127.0.0.1,localstack,host.docker.internal
