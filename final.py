@@ -1,30 +1,8 @@
+# from your host, in the same folder as docker-compose.yml
+docker compose exec enrollment-writer bash   # or sh
 
-
-# from repo root
-export ENDPOINT=http://localhost:4566
-
-ENR_URL=$(aws --endpoint-url="$ENDPOINT" sqs get-queue-url \
-  --queue-name sqsq2 \
-  --query 'QueueUrl' \
-  --output text)
-
-echo "Enrollment queue URL: $ENR_URL"
-
-aws --endpoint-url="$ENDPOINT" sqs send-message \
-  --queue-url "$ENR_URL" \
-  --message-body file://tests/local/enrollment-test.json
-
-
-
-------------------------------------------
-
-
-docker logs -f enrollment-writer
-
-
-
--------------------------------------------
-
-
-
-
+# now inside the container
+cd /app                                      # repo root (adjust if needed)
+pipenv run behave tests/component/features \
+  --format=json.pretty \
+  --outfile=./reports/cucumber.json
