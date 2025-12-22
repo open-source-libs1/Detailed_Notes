@@ -1,81 +1,149 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-HERE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${HERE_DIR}/.." && pwd)"
-cd "${REPO_ROOT}"
+# ------------------------------------------------------------
+# Component tests runner (host execution)
+#
+# One-command goal:
+#   ./run.sh test component
+#
+# Key ideas:
+# - behave/pipenv runs on your HOST machine (not inside docker)
+# - therefore the AWS SDK endpoint MUST be "localhost:4566"
+#   (NOT "localstack:4566" which only resolves inside docker network)
+# - resolve SQS QueueUrl dynamically from LocalStack
+# - configure corporate CA bundle automatically (no manual export)
+# ------------------------------------------------------------
 
-# Load localstack env (queues/DB/region/etc.)
-set -a
-# shellcheck disable=SC1090
-. "${HERE_DIR}/.env"
-set +a
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-# ---- HOST CA bundle handling (pipenv runs on host, not inside container) ----
-HOST_CA="${HOME}/certs/C1G2RootCA.crt"
-if [[ -f "${HOST_CA}" ]]; then
-  echo "[component] Using HOST CA bundle: ${HOST_CA}"
-  export REQUESTS_CA_BUNDLE="${HOST_CA}"
-  export CURL_CA_BUNDLE="${HOST_CA}"
-  export NODE_EXTRA_CA_CERTS="${HOST_CA}"
+echo "[component] SCRIPT_DIR=${SCRIPT_DIR}"
+echo "[component] REPO_ROOT=${REPO_ROOT}"
+
+# Load LocalStack env (optional)
+ENV_FILE="${SCRIPT_DIR}/.env"
+if [[ -f "${ENV_FILE}" ]]; then
+  echo "[component] Loading ${ENV_FILE}"
+  # Export non-comment, non-empty lines
+  # shellcheck disable=SC2046
+  export $(grep -v '^\s*#' "${ENV_FILE}" | grep -v '^\s*$' | xargs -0 2>/dev/null || true) || true
 else
-  echo "[component] WARN: Host CA bundle not found at ${HOST_CA}. Unsetting CA bundle envs for host installs."
-  unset REQUESTS_CA_BUNDLE CURL_CA_BUNDLE NODE_EXTRA_CA_CERTS
+  echo "[component] NOTE: ${ENV_FILE} not found; continuing with existing shell env."
 fi
 
-LOCALSTACK_CONTAINER="${LOCALSTACK_CONTAINER:-localstack-enrollment}"
+# ---- LocalStack endpoint for HOST-run tests ----
+ENDPOINT="${LOCALSTACK_ENDPOINT:-http://localhost:4566}"
+AWS_REGION="${AWS_REGION:-us-east-1}"
 
-echo "[component] Waiting for LocalStack bootstrap to be healthy..."
-until [[ "$(docker inspect -f '{{.State.Health.Status}}' "${LOCALSTACK_CONTAINER}" 2>/dev/null || echo "starting")" == "healthy" ]]; do
-  sleep 2
-done
-echo "[component] LocalStack is healthy."
+# Avoid corporate proxy interfering with localhost calls
+export NO_PROXY="${NO_PROXY:-},localhost,127.0.0.1"
+export no_proxy="${no_proxy:-},localhost,127.0.0.1"
 
-ENDPOINT="${ENDPOINT_HOST:-http://localhost:4566}"
-REGION="${AWS_DEFAULT_REGION:-us-east-1}"
-AWS_CMD=(aws --endpoint-url="${ENDPOINT}" --region "${REGION}")
+# LocalStack dummy credentials
+export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-test}"
+export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-test}"
+export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-${AWS_REGION}}"
 
-# Resolve enrollment queue URL for tests
-QUEUE_NAME="${ENROLLMENT_QUEUE_NAME:-sqsq2}"
-QUEUE_URL="$("${AWS_CMD[@]}" sqs get-queue-url --queue-name "${QUEUE_NAME}" --query 'QueueUrl' --output text)"
-QUEUE_URL="$(printf '%s' "${QUEUE_URL}" | sed 's#\\\/#/#g; s#\\##g')"
-QUEUE_URL="$(printf '%s' "${QUEUE_URL}" | sed 's#http://localstack:4566#http://localhost:4566#g; s#https://localstack:4566#http://localhost:4566#g')"
+# Common endpoint envs (helps internal wrappers too)
+export AWS_ENDPOINT_URL="${AWS_ENDPOINT_URL:-${ENDPOINT}}"
+export AWS_ENDPOINT_URL_SQS="${AWS_ENDPOINT_URL_SQS:-${ENDPOINT}}"
 
-mkdir -p "${HERE_DIR}/reports"
+echo "[component] Using endpoint: ${ENDPOINT}"
+echo "[component] Using region:   ${AWS_DEFAULT_REGION}"
+echo "[component] NO_PROXY:       ${NO_PROXY}"
 
-# Export env vars used by component tests
-export ENVIRONMENT=local
-export AWS_DEFAULT_REGION="${REGION}"
-export SQS_QUEUE_URL="${QUEUE_URL}"
+# ---- DB config (host-run) ----
+DB_NAME="${DB_NAME:-referrals_db}"
+DB_USER="${DB_USER:-postgres}"
+DB_PASSWORD="${DB_PASSWORD:-postgres}"
+DB_PORT="${DB_PORT:-29464}"
+DB_HOST="${DB_HOST:-localhost}"
 
-# ---- DB HOST FIX (host-run tests cannot resolve host.docker.internal) ----
-DB_HOST_EFFECTIVE="${DB_HOST:-localhost}"
-if [[ "${DB_HOST_EFFECTIVE}" == "host.docker.internal" ]]; then
+# If .env is tuned for containers, override for host-run
+if [[ "${DB_HOST}" == "host.docker.internal" ]]; then
   echo "[component] NOTE: DB_HOST=host.docker.internal is for containers. Overriding to localhost for host-run tests."
-  DB_HOST_EFFECTIVE="localhost"
+  DB_HOST="localhost"
 fi
 
-export DB_NAME="${DB_NAME}"
-export DB_HOST="${DB_HOST_EFFECTIVE}"
-export DB_USER="${DB_USER}"
-export DB_PASSWORD="${DB_PASSWORD}"
-export DB_PORT="${DB_PORT}"
+export DB_NAME DB_USER DB_PASSWORD DB_PORT DB_HOST
 
 echo "[component] DB effective config: host=${DB_HOST} port=${DB_PORT} db=${DB_NAME} user=${DB_USER}"
+
+# ---- Resolve SQS queue URL from LocalStack ----
+QUEUE_NAME="${COMPONENT_TEST_QUEUE_NAME:-sqsq2}"
+
+echo "[component] Resolving QueueUrl for ${QUEUE_NAME}..."
+SQS_QUEUE_URL="$(
+  aws --endpoint-url="${ENDPOINT}" sqs get-queue-url \
+    --queue-name "${QUEUE_NAME}" \
+    --query 'QueueUrl' \
+    --output text
+)"
+
+if [[ -z "${SQS_QUEUE_URL}" || "${SQS_QUEUE_URL}" == "None" ]]; then
+  echo "[component] ERROR: Could not resolve QueueUrl for ${QUEUE_NAME}. Is LocalStack up and bootstrap complete?"
+  echo "[component] Try: docker compose ps && docker logs localstack-enrollment"
+  exit 1
+fi
+
+export SQS_QUEUE_URL="${SQS_QUEUE_URL}"
 echo "[component] SQS_QUEUE_URL=${SQS_QUEUE_URL}"
 
-echo "[component] Installing python deps via pipenv (host)..."
-pipenv install --dev
+# ---- Corporate TLS CA bundle (host-run) ----
+# Your earlier failure happened because pipenv/pip was pointed to a *container* path like /root/certs/...
+# Here we choose a HOST path automatically so pipenv can install from Artifactory.
 
-# Ensure behave exists (install into venv if missing)
-if ! pipenv run python -c "import behave" >/dev/null 2>&1; then
-  echo "[component] 'behave' not found in venv. Installing behave into Pipenv environment..."
-  pipenv run pip install -q behave
+pick_ca_bundle() {
+  # If user already exported one, keep it.
+  if [[ -n "${HOST_CA_BUNDLE:-}" && -f "${HOST_CA_BUNDLE}" ]]; then
+    echo "${HOST_CA_BUNDLE}"
+    return 0
+  fi
+
+  # Common corporate paths (edit/add if your org uses something else)
+  local candidates=(
+    "${HOME}/certs/C1G2RootCA.crt"
+    "${HOME}/certs/C1G2RootCA.pem"
+    "${HOME}/certs/ca-bundle.crt"
+    "/etc/ssl/cert.pem"                 # macOS system bundle (fallback)
+    "/etc/ssl/certs/ca-certificates.crt" # linux fallback
+  )
+
+  local c
+  for c in "${candidates[@]}"; do
+    if [[ -f "${c}" ]]; then
+      echo "${c}"
+      return 0
+    fi
+  done
+
+  # No file found
+  return 1
+}
+
+if CA_BUNDLE_PATH="$(pick_ca_bundle)"; then
+  echo "[component] Using HOST CA bundle: ${CA_BUNDLE_PATH}"
+  export REQUESTS_CA_BUNDLE="${CA_BUNDLE_PATH}"
+  export PIP_CERT="${CA_BUNDLE_PATH}"
+else
+  echo "[component] WARN: No host CA bundle found."
+  echo "[component] WARN: If pipenv fails to reach Artifactory, create ${HOME}/certs/C1G2RootCA.crt"
+  echo "[component] WARN: Or export HOST_CA_BUNDLE=/path/to/your/ca.crt and re-run."
+fi
+
+# ---- Run tests ----
+cd "${REPO_ROOT}"
+
+echo "[component] Installing python deps via pipenv (host)..."
+if [[ -f "Pipfile.lock" ]]; then
+  pipenv sync --dev
+else
+  pipenv install --dev
 fi
 
 echo "[component] Running behave..."
-pipenv run python -m behave tests/component/features \
-  --format=json.pretty \
-  --outfile="${HERE_DIR}/reports/cucumber.json"
+mkdir -p reports
+pipenv run behave tests/component/features --format=json.pretty --outfile=./reports/cucumber.json
 
-echo "[component] Done. Report: ${HERE_DIR}/reports/cucumber.json"
+echo "[component] Done. Report: reports/cucumber.json"
