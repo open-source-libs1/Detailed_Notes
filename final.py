@@ -1,11 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Runs behave component tests from the HOST.
-# - Waits for LocalStack container health.
-# - Fixes CA bundle paths for HOST (macOS) installs.
-# - Ensures "behave" exists (installs if missing) without changing repo files.
-
 HERE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${HERE_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
@@ -53,23 +48,31 @@ export ENVIRONMENT=local
 export AWS_DEFAULT_REGION="${REGION}"
 export SQS_QUEUE_URL="${QUEUE_URL}"
 
+# ---- DB HOST FIX (host-run tests cannot resolve host.docker.internal) ----
+DB_HOST_EFFECTIVE="${DB_HOST:-localhost}"
+if [[ "${DB_HOST_EFFECTIVE}" == "host.docker.internal" ]]; then
+  echo "[component] NOTE: DB_HOST=host.docker.internal is for containers. Overriding to localhost for host-run tests."
+  DB_HOST_EFFECTIVE="localhost"
+fi
+
 export DB_NAME="${DB_NAME}"
-export DB_HOST="${DB_HOST}"
+export DB_HOST="${DB_HOST_EFFECTIVE}"
 export DB_USER="${DB_USER}"
 export DB_PASSWORD="${DB_PASSWORD}"
 export DB_PORT="${DB_PORT}"
 
+echo "[component] DB effective config: host=${DB_HOST} port=${DB_PORT} db=${DB_NAME} user=${DB_USER}"
+echo "[component] SQS_QUEUE_URL=${SQS_QUEUE_URL}"
+
 echo "[component] Installing python deps via pipenv (host)..."
-# Use --dev in case behave lives under dev-packages
 pipenv install --dev
 
-# ---- Ensure behave exists (do NOT change repo; install into venv if missing) ----
+# Ensure behave exists (install into venv if missing)
 if ! pipenv run python -c "import behave" >/dev/null 2>&1; then
   echo "[component] 'behave' not found in venv. Installing behave into Pipenv environment..."
   pipenv run pip install -q behave
 fi
 
-# Prefer python -m behave so we don't rely on PATH resolution for the entrypoint
 echo "[component] Running behave..."
 pipenv run python -m behave tests/component/features \
   --format=json.pretty \
