@@ -3,170 +3,127 @@ set -euo pipefail
 
 log() { echo "[component] $*"; }
 
-# -----------------------------
-# Paths
-# -----------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 log "SCRIPT_DIR=${SCRIPT_DIR}"
 log "REPO_ROOT=${REPO_ROOT}"
 
-# Always run behave from repo root so it finds: tests/component/features/steps
-cd "${REPO_ROOT}"
+# -------- Load env file (prefer .env.localstack, fallback .env) --------
+ENV_FILE="${ENV_FILE:-${SCRIPT_DIR}/.env.localstack}"
+[[ -f "${ENV_FILE}" ]] || ENV_FILE="${SCRIPT_DIR}/.env"
 
-# -----------------------------
-# Load .env (if present)
-# -----------------------------
-ENV_FILE="${SCRIPT_DIR}/.env"
 if [[ -f "${ENV_FILE}" ]]; then
   log "Loaded ${ENV_FILE}"
+  set -a
   # shellcheck disable=SC1090
-  set -a && source "${ENV_FILE}" && set +a
+  source "${ENV_FILE}"
+  set +a
 else
-  log "NOTE: ${ENV_FILE} not found; continuing with current env."
+  log "WARN: No env file found at ${SCRIPT_DIR}/.env.localstack or ${SCRIPT_DIR}/.env"
 fi
 
-# -----------------------------
-# Host-vs-container endpoint
-# -----------------------------
-# IMPORTANT:
-# - When you run component tests on the HOST (pipenv), "localstack" hostname usually does NOT resolve.
-# - Use localhost for the endpoint and queue URLs.
-ENDPOINT_HOST="${ENDPOINT_HOST:-localhost}"
-ENDPOINT_PORT="${ENDPOINT_PORT:-4566}"
-ENDPOINT="http://${ENDPOINT_HOST}:${ENDPOINT_PORT}"
+# -------- CA bundle (no manual export needed) --------
+# Prefer explicit HOST_CA_BUNDLE if already provided; else default to your shown path.
+if [[ -z "${HOST_CA_BUNDLE:-}" ]]; then
+  if [[ -f "${HOME}/certs/C1G2RootCA.crt" ]]; then
+    export HOST_CA_BUNDLE="${HOME}/certs/C1G2RootCA.crt"
+  fi
+fi
 
-log "Using endpoint: ${ENDPOINT}"
-log "Using region: ${AWS_DEFAULT_REGION:-us-east-1}"
+if [[ -n "${HOST_CA_BUNDLE:-}" ]]; then
+  export AWS_CA_BUNDLE="${HOST_CA_BUNDLE}"
+  export REQUESTS_CA_BUNDLE="${HOST_CA_BUNDLE}"
+  export CURL_CA_BUNDLE="${HOST_CA_BUNDLE}"
+  log "Using HOST CA bundle: ${HOST_CA_BUNDLE}"
+else
+  log "WARN: HOST_CA_BUNDLE not set; continuing"
+fi
 
-# Provide common endpoint envs in case your code reads them (environment_global, etc.)
-export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
-export AWS_REGION="${AWS_DEFAULT_REGION}"
-export LOCALSTACK_ENDPOINT="${ENDPOINT}"
-export AWS_ENDPOINT_URL="${ENDPOINT}"
-export AWS_ENDPOINT_URL_SQS="${ENDPOINT}"
-export AWS_ENDPOINT_URL_S3="${ENDPOINT}"
-export AWS_ENDPOINT_URL_SECRETSMANAGER="${ENDPOINT}"
-
-# Ensure ENVIRONMENT exists (your behave env.py reads it)
+# -------- Required defaults for LocalStack --------
 export ENVIRONMENT="${ENVIRONMENT:-local}"
+export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
+export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-test}"
+export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-test}"
+
+# Host-run tests should normally hit localhost:4566.
+export AWS_ENDPOINT_URL="${AWS_ENDPOINT_URL:-http://localhost:4566}"
+export AWS_ENDPOINT_URL_SQS="${AWS_ENDPOINT_URL_SQS:-${AWS_ENDPOINT_URL}}"
+
+log "Using endpoint: ${AWS_ENDPOINT_URL}"
+log "Using region:   ${AWS_DEFAULT_REGION}"
 log "ENVIRONMENT=${ENVIRONMENT}"
 
-# -----------------------------
-# DB config (host-run tests)
-# -----------------------------
-# Your .env may have DB_HOST=host.docker.internal (good for containers).
-# For host-run tests, keep localhost.
-export DB_NAME="${DB_NAME:-referrals_db}"
-export DB_USER="${DB_USER:-postgres}"
-export DB_PASSWORD="${DB_PASSWORD:-postgres}"
-export DB_PORT="${DB_PORT:-29464}"
-
+# If .env is container-oriented, force host DB for host-run tests
 if [[ "${DB_HOST:-}" == "host.docker.internal" ]]; then
   log "NOTE: DB_HOST=host.docker.internal is for containers. Overriding to localhost for host-run tests."
   export DB_HOST="localhost"
-else
-  export DB_HOST="${DB_HOST:-localhost}"
 fi
 
-log "DB effective config: host=${DB_HOST} port=${DB_PORT} db=${DB_NAME} user=${DB_USER}"
+log "DB effective config: host=${DB_HOST:-} port=${DB_PORT:-} db=${DB_NAME:-} user=${DB_USER:-}"
 
-# -----------------------------
-# CA bundle (set INSIDE script)
-# -----------------------------
-# Your pip/pipenv run on HOST needs a HOST-valid CA path (not /root/...).
-HOST_CA_BUNDLE="${HOST_CA_BUNDLE:-${HOME}/certs/C1G2RootCA.crt}"
-if [[ -f "${HOST_CA_BUNDLE}" ]]; then
-  export REQUESTS_CA_BUNDLE="${HOST_CA_BUNDLE}"
-  export AWS_CA_BUNDLE="${HOST_CA_BUNDLE}"
-  export CURL_CA_BUNDLE="${HOST_CA_BUNDLE}"
-  export SSL_CERT_FILE="${HOST_CA_BUNDLE}"
-  log "Using HOST CA bundle: ${HOST_CA_BUNDLE}"
+# -------- LocalStack health check (bounded) --------
+if [[ "${SKIP_LOCALSTACK_HEALTH:-0}" == "1" ]]; then
+  log "Skipping LocalStack health check (SKIP_LOCALSTACK_HEALTH=1)"
 else
-  log "WARNING: HOST_CA_BUNDLE not found at: ${HOST_CA_BUNDLE}"
-  log "WARNING: If pipenv install hits TLS issues, set HOST_CA_BUNDLE in localstack/.env to a valid host path."
+  timeout_s="${LOCALSTACK_HEALTH_TIMEOUT:-30}"
+  log "Waiting for LocalStack bootstrap to be healthy (max ${timeout_s}s)..."
+  start=$SECONDS
+  while true; do
+    if curl -fsS "${AWS_ENDPOINT_URL}/_localstack/health" >/dev/null 2>&1; then
+      log "LocalStack is healthy."
+      break
+    fi
+    if (( SECONDS - start >= timeout_s )); then
+      log "WARN: LocalStack health endpoint not ready after ${timeout_s}s; continuing anyway."
+      break
+    fi
+    sleep 2
+  done
 fi
 
-# -----------------------------
-# Health check (bounded; won’t hang forever)
-# -----------------------------
-MAX_WAIT_SECONDS="${MAX_WAIT_SECONDS:-30}"
-SLEEP_SECONDS=2
-
-log "Waiting for LocalStack bootstrap to be healthy (max ${MAX_WAIT_SECONDS}s)..."
-start_ts="$(date +%s)"
-while true; do
-  # Avoid proxy interference on health checks
-  if curl -fsS --max-time 2 --noproxy "*" "${ENDPOINT}/_localstack/health" >/dev/null 2>&1 \
-    || curl -fsS --max-time 2 --noproxy "*" "${ENDPOINT}/health" >/dev/null 2>&1; then
-    log "LocalStack is healthy."
-    break
-  fi
-
-  now_ts="$(date +%s)"
-  if (( now_ts - start_ts >= MAX_WAIT_SECONDS )); then
-    log "WARNING: Health check timeout after ${MAX_WAIT_SECONDS}s. Continuing anyway."
-    break
-  fi
-  sleep "${SLEEP_SECONDS}"
-done
-
-# -----------------------------
-# Resolve SQS queue URL for sqsq2 (sanitize escapes)
-# -----------------------------
-QUEUE_NAME="${QUEUE_NAME:-sqsq2}"
+# -------- Resolve QueueUrl (NO escaped slashes) --------
+QUEUE_NAME="${QUEUE_NAME:-${SQS_QUEUE_NAME:-sqsq2}}"
 log "Resolving QueueUrl for ${QUEUE_NAME}..."
 
-# Use --output text to avoid JSON escaping (http:\/\/...)
-RAW_QUEUE_URL="$(
-  aws --endpoint-url="${ENDPOINT}" sqs get-queue-url \
+SQS_QUEUE_URL=""
+if command -v awslocal >/dev/null 2>&1; then
+  # --output text avoids the http:\/\/ escaping problem
+  SQS_QUEUE_URL="$(awslocal --endpoint-url "${AWS_ENDPOINT_URL_SQS}" \
+    sqs get-queue-url \
     --queue-name "${QUEUE_NAME}" \
     --query 'QueueUrl' \
-    --output text 2>/dev/null || true
-)"
+    --output text 2>/dev/null || true)"
+fi
 
-if [[ -z "${RAW_QUEUE_URL}" || "${RAW_QUEUE_URL}" == "None" ]]; then
-  log "ERROR: Could not resolve QueueUrl for ${QUEUE_NAME}."
-  log "TIP: Make sure bootstrap created the queue. Try: aws --endpoint-url='${ENDPOINT}' sqs list-queues"
+# Optional hardcode override if you REALLY want exactly what’s in your screenshot
+# export SQS_QUEUE_URL_OVERRIDE="http://localstack:4566/queue/us-east-1/000000000000/sqsq2"
+if [[ -z "${SQS_QUEUE_URL}" || "${SQS_QUEUE_URL}" == "None" ]]; then
+  SQS_QUEUE_URL="${SQS_QUEUE_URL_OVERRIDE:-}"
+fi
+
+if [[ -z "${SQS_QUEUE_URL}" ]]; then
+  log "ERROR: Could not resolve SQS_QUEUE_URL for ${QUEUE_NAME}."
+  log "       Ensure the queue exists: awslocal --endpoint-url ${AWS_ENDPOINT_URL_SQS} sqs create-queue --queue-name ${QUEUE_NAME}"
   exit 1
 fi
 
-# Extra safety: strip quotes and unescape any accidental http:\/\/
-SANITIZED_QUEUE_URL="$(echo "${RAW_QUEUE_URL}" | tr -d '"' | sed 's#\\/#/#g')"
-export SQS_QUEUE_URL="${SANITIZED_QUEUE_URL}"
+export SQS_QUEUE_URL
 log "SQS_QUEUE_URL=${SQS_QUEUE_URL}"
 
-# Print the exact env vars your behave environment.py expects
+# -------- Print env vars (as requested) --------
 log "Env summary:"
-log "  ENVIRONMENT=${ENVIRONMENT}"
-log "  AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}"
-log "  AWS_ENDPOINT_URL=${AWS_ENDPOINT_URL}"
-log "  SQS_QUEUE_URL=${SQS_QUEUE_URL}"
-log "  DB_NAME=${DB_NAME}"
-log "  DB_HOST=${DB_HOST}"
-log "  DB_USER=${DB_USER}"
-log "  DB_PASSWORD=${DB_PASSWORD}"
-log "  DB_PORT=${DB_PORT}"
+for k in ENVIRONMENT AWS_DEFAULT_REGION AWS_ENDPOINT_URL AWS_ENDPOINT_URL_SQS SQS_QUEUE_URL \
+         DB_NAME DB_HOST DB_USER DB_PASSWORD DB_PORT HOST_CA_BUNDLE AWS_CA_BUNDLE REQUESTS_CA_BUNDLE; do
+  log "  ${k}=${!k-}"
+done
 
-# -----------------------------
-# Install deps + run behave
-# -----------------------------
+# -------- Run tests from repo root (fixes steps-dir issue) --------
+cd "${REPO_ROOT}"
+
 log "Installing python deps via pipenv (host)..."
-# Prefer sync to exactly match Pipfile.lock; fall back to install if needed.
-if command -v pipenv >/dev/null 2>&1; then
-  pipenv sync --dev || pipenv install --dev
-else
-  log "ERROR: pipenv not found on PATH."
-  exit 1
-fi
-
-mkdir -p "${REPO_ROOT}/reports"
+pipenv sync --dev
 
 log "Running behave..."
-# Use python -m behave to avoid “behave could not be found” edge cases.
-pipenv run python -m behave tests/component/features \
-  --format=json.pretty \
-  --outfile="${REPO_ROOT}/reports/cucumber.json"
-
-log "Done."
+mkdir -p "${REPO_ROOT}/reports"
+pipenv run behave tests/component/features --format=json.pretty --outfile="${REPO_ROOT}/reports/cucumber.json"
