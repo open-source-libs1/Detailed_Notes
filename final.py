@@ -1,14 +1,24 @@
-#!/usr/bin/env bash
-set -euo pipefail
+services:
+  localstack:
+    # ... keep everything else the same
 
-# Always run from the folder where this script lives (localstack/)
-HERE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "${HERE_DIR}"
+    healthcheck:
+      # Healthy only when:
+      #  1) LocalStack API is up
+      #  2) The DB secret exists (provisioned by 00-enrollment-init.sh)
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS http://localhost:4566/health >/dev/null \
+           && awslocal secretsmanager describe-secret --secret-id \"${SECRET_ARN:-enrollment-db-local}\" >/dev/null 2>&1"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 20s
 
-echo "[run] PWD=$(pwd)"
-echo "[run] Building lambda ZIP(s) locally..."
-./build_lambdas.sh
-
-echo "[run] Starting docker compose..."
-# docker compose already uses docker-compose.yml in this same folder
-docker compose up --build
+  enrollment-writer:
+    # ... keep everything else the same
+    depends_on:
+      localstack:
+        condition: service_healthy
