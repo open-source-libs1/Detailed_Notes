@@ -1,40 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ======================================================================================
-# run.sh
-# One entrypoint for local usage:
-#   ./run.sh up                 -> build lambda zip(s) + docker compose up --build
-#   ./run.sh down               -> docker compose down
-#   ./run.sh logs localstack    -> tail localstack logs
-#   ./run.sh logs enrollment-writer
-#   ./run.sh test sqs1          -> send sample msg to sqsq1 (triggers qsink lambda)
-#   ./run.sh test sqs2          -> send sample msg to sqsq2 (direct to enrollment-writer)
-#   ./run.sh component-test     -> run behave component tests locally (host)
-# ======================================================================================
+# ---------------------------------------------
+# Single entrypoint script for local workflow.
+#
+# Usage:
+#   ./run.sh                      # build zips + docker compose up --build
+#   ./run.sh up                   # same as default
+#   ./run.sh down                 # docker compose down -v
+#   ./run.sh build                # build lambda zips only
+#   ./run.sh logs [service]       # follow logs (optional service)
+#   ./run.sh test sqs1            # send test message to sqsq1
+#   ./run.sh test sqs2            # send test message to sqsq2
+#   ./run.sh test component       # run behave component tests (host)
+# ---------------------------------------------
 
 HERE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${HERE_DIR}"
 
-usage() {
-  cat <<EOF
-Usage:
-  ./run.sh up
-  ./run.sh down
-  ./run.sh logs localstack|enrollment-writer
-  ./run.sh test sqs1|sqs2
-  ./run.sh component-test
-
-Notes:
-  - Ensure localstack/.env is present and correct.
-  - 'up' builds lambda ZIPs on host and mounts them into LocalStack.
-EOF
-}
-
-cmd="${1:-}"
+cmd="${1:-up}"
+sub="${2:-}"
+sub2="${3:-}"
 
 case "${cmd}" in
-  up)
+  up|"")
     echo "[run] PWD=$(pwd)"
     echo "[run] Building lambda ZIP(s) locally..."
     ./build_lambdas.sh
@@ -42,30 +31,41 @@ case "${cmd}" in
     echo "[run] Starting docker compose..."
     docker compose up --build
     ;;
+
   down)
-    docker compose down
+    echo "[run] Stopping stack..."
+    docker compose down -v
     ;;
+
+  build)
+    echo "[run] Building lambda ZIP(s) locally..."
+    ./build_lambdas.sh
+    ;;
+
   logs)
-    target="${2:-}"
-    if [ -z "${target}" ]; then usage; exit 1; fi
-    docker compose logs -f "${target}"
-    ;;
-  test)
-    which="${2:-}"
-    if [ "${which}" = "sqs1" ]; then
-      ./test_sqs1.sh
-    elif [ "${which}" = "sqs2" ]; then
-      ./test_sqs2.sh
+    if [[ -n "${sub}" ]]; then
+      docker compose logs -f "${sub}"
     else
-      usage
-      exit 1
+      docker compose logs -f
     fi
     ;;
-  component-test)
-    ./component_tests.sh
+
+  test)
+    case "${sub}" in
+      sqs1) ./test_sqs1.sh ;;
+      sqs2) ./test_sqs2.sh ;;
+      component) ./component_tests.sh ;;
+      *)
+        echo "Unknown test: ${sub}"
+        echo "Use: ./run.sh test {sqs1|sqs2|component}"
+        exit 1
+        ;;
+    esac
     ;;
+
   *)
-    usage
+    echo "Unknown command: ${cmd}"
+    echo "Try: ./run.sh up | down | build | logs | test"
     exit 1
     ;;
 esac
@@ -74,225 +74,161 @@ esac
 
 
 
-
-//////////////////////
+//////////////////////////
 
 
 
 #!/usr/bin/env bash
 set -euo pipefail
+
+# Sends a sample message to QSINK_QUEUE_NAME (sqsq1)
 
 HERE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${HERE_DIR}"
 
-# Load env (names/region)
+# Load .env
 set -a
-# shellcheck disable=SC1091
-source ./.env
+# shellcheck disable=SC1090
+. ./.env
 set +a
 
-ENDPOINT="${AWS_ENDPOINT_URL:-http://localhost:4566}"
-REGION="${AWS_DEFAULT_REGION:-us-east-1}"
+LOCALSTACK_CONTAINER="${LOCALSTACK_CONTAINER:-localstack-enrollment}"
 
-echo "[test_sqs1] Waiting for LocalStack to be ready..."
-until curl -fsS "${ENDPOINT}/health" >/dev/null 2>&1; do
-  sleep 1
+echo "[test_sqs1] Waiting for LocalStack bootstrap to be healthy..."
+until [[ "$(docker inspect -f '{{.State.Health.Status}}' "${LOCALSTACK_CONTAINER}" 2>/dev/null || echo "starting")" == "healthy" ]]; do
+  sleep 2
 done
+echo "[test_sqs1] LocalStack is healthy."
 
-QSINK_URL="$(aws --endpoint-url="${ENDPOINT}" sqs get-queue-url \
-  --queue-name "${QSINK_QUEUE_NAME}" --region "${REGION}" \
-  --query QueueUrl --output text)"
+ENDPOINT="${ENDPOINT_HOST:-http://localhost:4566}"
+QUEUE_NAME="${QSINK_QUEUE_NAME:-sqsq1}"
 
-echo "[test_sqs1] QSINK queue url: ${QSINK_URL}"
+AWS_CMD=(aws --endpoint-url="${ENDPOINT}")
 
-# Minimal BANK payload (matches your handler's required fields)
-BODY='{"account_key":"820856933390","account_key_type":"TOKENIZEDBAN","program_code":"3882","source_id":"BANK","is_enrollment_active":true}'
+echo "[test_sqs1] Resolving QueueUrl for ${QUEUE_NAME}..."
+QUEUE_URL="$("${AWS_CMD[@]}" sqs get-queue-url --queue-name "${QUEUE_NAME}" --query 'QueueUrl' --output text)"
 
-aws --endpoint-url="${ENDPOINT}" sqs send-message \
-  --queue-url "${QSINK_URL}" \
-  --message-body "${BODY}" \
-  --region "${REGION}" >/dev/null
+# Normalize for host use (LocalStack sometimes returns http://localstack:4566/...)
+QUEUE_URL="${QUEUE_URL/http:\/\/localstack:4566/http:\/\/localhost:4566}"
 
-echo "[test_sqs1] Sent message to ${QSINK_QUEUE_NAME}."
-echo "[test_sqs1] Now tail logs:"
-echo "  ./run.sh logs localstack"
-echo "  ./run.sh logs enrollment-writer"
+echo "[test_sqs1] QueueUrl=${QUEUE_URL}"
 
+BODY='{"account_key":"820856933390","account_key_type":"TOKENIZEDBAN","sor_id":"185","is_enrollment_active":true,"program_code":"3882","source_id":"BANK"}'
 
+echo "[test_sqs1] Sending message..."
+"${AWS_CMD[@]}" sqs send-message --queue-url "${QUEUE_URL}" --message-body "${BODY}" >/dev/null
 
-
+echo "[test_sqs1] Done."
 
 
-//////////////////////
 
+
+
+////////////////////////////////////////
 
 
 
 #!/usr/bin/env bash
 set -euo pipefail
+
+# Sends a sample message directly to ENROLLMENT_QUEUE_NAME (sqsq2)
 
 HERE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${HERE_DIR}"
 
 set -a
-# shellcheck disable=SC1091
-source ./.env
+# shellcheck disable=SC1090
+. ./.env
 set +a
 
-ENDPOINT="${AWS_ENDPOINT_URL:-http://localhost:4566}"
-REGION="${AWS_DEFAULT_REGION:-us-east-1}"
+LOCALSTACK_CONTAINER="${LOCALSTACK_CONTAINER:-localstack-enrollment}"
 
-echo "[test_sqs2] Waiting for LocalStack to be ready..."
-until curl -fsS "${ENDPOINT}/health" >/dev/null 2>&1; do
-  sleep 1
+echo "[test_sqs2] Waiting for LocalStack bootstrap to be healthy..."
+until [[ "$(docker inspect -f '{{.State.Health.Status}}' "${LOCALSTACK_CONTAINER}" 2>/dev/null || echo "starting")" == "healthy" ]]; do
+  sleep 2
 done
+echo "[test_sqs2] LocalStack is healthy."
 
-ENR_URL="$(aws --endpoint-url="${ENDPOINT}" sqs get-queue-url \
-  --queue-name "${ENROLLMENT_QUEUE_NAME}" --region "${REGION}" \
-  --query QueueUrl --output text)"
+ENDPOINT="${ENDPOINT_HOST:-http://localhost:4566}"
+QUEUE_NAME="${ENROLLMENT_QUEUE_NAME:-sqsq2}"
 
-echo "[test_sqs2] Enrollment queue url: ${ENR_URL}"
+AWS_CMD=(aws --endpoint-url="${ENDPOINT}")
 
-BODY='{"account_key":"820856933390","account_key_type":"TOKENIZEDBAN","program_code":"3882","source_id":"BANK","is_enrollment_active":true}'
+echo "[test_sqs2] Resolving QueueUrl for ${QUEUE_NAME}..."
+QUEUE_URL="$("${AWS_CMD[@]}" sqs get-queue-url --queue-name "${QUEUE_NAME}" --query 'QueueUrl' --output text)"
+QUEUE_URL="${QUEUE_URL/http:\/\/localstack:4566/http:\/\/localhost:4566}"
 
-aws --endpoint-url="${ENDPOINT}" sqs send-message \
-  --queue-url "${ENR_URL}" \
-  --message-body "${BODY}" \
-  --region "${REGION}" >/dev/null
+echo "[test_sqs2] QueueUrl=${QUEUE_URL}"
 
-echo "[test_sqs2] Sent message to ${ENROLLMENT_QUEUE_NAME}."
-echo "[test_sqs2] Tail logs:"
-echo "  ./run.sh logs enrollment-writer"
+BODY='{"account_key":"820856933390","account_key_type":"TOKENIZEDBAN","sor_id":"185","is_enrollment_active":true,"program_code":"3882","source_id":"BANK"}'
 
+echo "[test_sqs2] Sending message..."
+"${AWS_CMD[@]}" sqs send-message --queue-url "${QUEUE_URL}" --message-body "${BODY}" >/dev/null
 
-
+echo "[test_sqs2] Done."
 
 
-///////////////////////////////////////
+
+
+
+////////////////////
 
 
 
 #!/usr/bin/env bash
 set -euo pipefail
+
+# Runs behave component tests from the HOST.
+# Assumes:
+#  - enrollment-writer container is running (docker compose up)
+#  - LocalStack bootstrap is healthy
+#  - You have pipenv installed on host
 
 HERE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${HERE_DIR}/.." && pwd)"
-cd "${HERE_DIR}"
+cd "${REPO_ROOT}"
 
+# Load local env for DB + region + queue names
 set -a
-# shellcheck disable=SC1091
-source ./.env
+# shellcheck disable=SC1090
+. "${HERE_DIR}/.env"
 set +a
 
-ENDPOINT="${AWS_ENDPOINT_URL:-http://localhost:4566}"
-REGION="${AWS_DEFAULT_REGION:-us-east-1}"
+LOCALSTACK_CONTAINER="${LOCALSTACK_CONTAINER:-localstack-enrollment}"
 
-echo "[component-test] Ensuring LocalStack is up..."
-until curl -fsS "${ENDPOINT}/health" >/dev/null 2>&1; do
-  sleep 1
+echo "[component] Waiting for LocalStack bootstrap to be healthy..."
+until [[ "$(docker inspect -f '{{.State.Health.Status}}' "${LOCALSTACK_CONTAINER}" 2>/dev/null || echo "starting")" == "healthy" ]]; do
+  sleep 2
 done
+echo "[component] LocalStack is healthy."
 
-# Use the enrollment queue URL for tests
-SQS_QUEUE_URL="$(aws --endpoint-url="${ENDPOINT}" sqs get-queue-url \
-  --queue-name "${ENROLLMENT_QUEUE_NAME}" --region "${REGION}" \
-  --query QueueUrl --output text)"
+ENDPOINT="${ENDPOINT_HOST:-http://localhost:4566}"
+AWS_CMD=(aws --endpoint-url="${ENDPOINT}")
 
-echo "[component-test] Using SQS_QUEUE_URL=${SQS_QUEUE_URL}"
+# Resolve enrollment queue URL for tests if your test runner needs it
+QUEUE_URL="$("${AWS_CMD[@]}" sqs get-queue-url --queue-name "${ENROLLMENT_QUEUE_NAME}" --query 'QueueUrl' --output text)"
+QUEUE_URL="${QUEUE_URL/http:\/\/localstack:4566/http:\/\/localhost:4566}"
 
-# Mirror your existing test script envs but for LocalStack
+mkdir -p "${HERE_DIR}/reports"
+
 export ENVIRONMENT=local
-export AWS_DEFAULT_REGION="${REGION}"
-export SQS_QUEUE_URL="${SQS_QUEUE_URL}"
+export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
+export SQS_QUEUE_URL="${QUEUE_URL}"
 
-# DB values (from .env)
+# DB vars used by tests (based on your screenshot pattern)
 export DB_NAME="${DB_NAME}"
 export DB_HOST="${DB_HOST}"
 export DB_USER="${DB_USER}"
 export DB_PASSWORD="${DB_PASSWORD}"
 export DB_PORT="${DB_PORT}"
 
-cd "${REPO_ROOT}"
+echo "[component] Installing python deps via pipenv (host)..."
+pipenv install
 
-echo "[component-test] Running behave..."
-pipenv run behave tests/component/features --format=json.pretty --outfile=./reports/cucumber.json
-echo "[component-test] Done. Report: ./reports/cucumber.json"
+echo "[component] Running behave..."
+pipenv run behave tests/component/features \
+  --format=json.pretty \
+  --outfile="${HERE_DIR}/reports/cucumber.json"
 
-
-
-
-
-///////////////////////////
-
-
-
-# LocalStack – ReferralPlatform Enrollment (Local)
-
-## What this setup does
-This folder provides a repeatable local environment using LocalStack Pro:
-- Creates S3 bucket, two SQS queues, and a Secrets Manager secret
-- Deploys the QSink forwarder lambda (host-built ZIP)
-- Connects SQS queue `sqsq1` -> QSink lambda (event source mapping)
-- Runs `enrollment-writer` container only after LocalStack bootstrap is complete
-
-**Important:** We do not modify application code (qsink lambda or enrollment writer).  
-All changes are isolated to the `localstack/` folder.
-
----
-
-## Prerequisites
-- Docker Desktop running
-- `aws` CLI installed
-- `pipenv` installed
-- Access to internal registries (LocalStack Pro image + lambda runtime mapping image)
-- Corporate certs available at: `$HOME/certs/C1G2RootCA.crt`
-
----
-
-## Files
-- `.env` : single source of truth for names/DB/proxy/certs
-- `build_lambdas.sh` : builds lambda ZIPs on host (robust install --target)
-- `00-enrollment-init.sh` : LocalStack bootstrap (idempotent resource creation)
-- `docker-compose.yml` : LocalStack + enrollment-writer wiring, health gating
-- `run.sh` : one command entrypoint + testing helpers
-- `test_sqs1.sh` : send message to sqsq1 (QSink input)
-- `test_sqs2.sh` : send message to sqsq2 (EnrollmentWriter input)
-- `component_tests.sh` : runs behave component tests against local stack
-
----
-
-## How to run
-
-### 1) Start stack (build zips + compose up)
-From `localstack/`:
-```bash
-./run.sh up
-
-
-
-
-./run.sh logs localstack
-./run.sh logs enrollment-writer
-
-
-
-./run.sh test sqs1
-./run.sh test sqs2
-
-
-./run.sh component-test
-
-docker compose logs -f localstack
-
-
-aws --endpoint-url=http://localhost:4566 secretsmanager list-secrets
-aws --endpoint-url=http://localhost:4566 sqs list-queues
-aws --endpoint-url=http://localhost:4566 s3 ls
-aws --endpoint-url=http://localhost:4566 lambda list-functions
-
-
-./run.sh down
-
-
-
-
+echo "[component] Done. Report: ${HERE_DIR}/reports/cucumber.json"
 
