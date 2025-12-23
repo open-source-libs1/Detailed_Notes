@@ -1,21 +1,20 @@
-# Capture send-message JSON output (keep your existing SEND_OUT assignment)
-# SEND_OUT="$("${AWS_CMD[@]}" sqs send-message ... --output json)"
+echo "[test_sqs1] Sending message..."
 
-# Parse MessageId + MD5 safely from JSON via stdin (no argv, no command-not-found)
-MSG_ID="$(python3 - <<'PY' <<<"$SEND_OUT"
-import json, sys
-d = json.load(sys.stdin)
-print(d.get("MessageId", ""))
-PY
+# IMPORTANT:
+#  - no >/dev/null
+#  - use --query + --output text so we get clean tokens (no JSON parsing needed)
+SEND_OUT="$("${AWS_CMD[@]}" sqs send-message \
+  --queue-url "${QUEUE_URL}" \
+  --message-body "${BODY}" \
+  --query '[MessageId,MD5OfMessageBody]' \
+  --output text
 )"
 
-MD5="$(python3 - <<'PY' <<<"$SEND_OUT"
-import json, sys
-d = json.load(sys.stdin)
-print(d.get("MD5OfMessageBody", ""))
-PY
-)"
+echo "[test_sqs1] send-message raw output: ${SEND_OUT:-<EMPTY>}"
+
+MSG_ID="$(printf '%s' "$SEND_OUT" | awk '{print $1}')"
+MD5="$(printf '%s' "$SEND_OUT" | awk '{print $2}')"
 
 echo "[test_sqs1] Sent"
-echo "[test_sqs1] MessageId=${MSG_ID}"
-echo "[test_sqs1] MD5OfMessageBody=${MD5}"
+echo "[test_sqs1] MessageId=${MSG_ID:-<EMPTY>}"
+echo "[test_sqs1] MD5OfMessageBody=${MD5:-<EMPTY>}"
