@@ -1,20 +1,10 @@
--- Finds tables in a schema that contain ALL the columns you specify
-with wanted_cols as (
-  select lower(col) as col_name
-  from (
-    select 'col1' as col union all
-    select 'col2' union all
-    select 'col3'
-    -- add/remove rows as needed
-  ) x
-)
+-- Find which table(s) in a schema contain ONE specific column
 select
   c.table_schema,
-  c.table_name
+  c.table_name,
+  c.column_name,
+  c.data_type
 from information_schema.columns c
-join wanted_cols w
-  on lower(c.column_name) = w.col_name
-where lower(c.table_schema) = lower('CompEngineMicroServiceOutput_QA')  -- change schema if needed
-group by c.table_schema, c.table_name
-having count(distinct w.col_name) = (select count(*) from wanted_cols)
-order by c.table_schema, c.table_name;
+where lower(c.table_schema) = lower('CompEngineMicroServiceOutput_QA')   -- <-- your schema
+  and lower(c.column_name)  = lower('YOUR_COLUMN_NAME')                 -- <-- your column
+order by c.table_name, c.ordinal_position;
