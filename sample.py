@@ -1,17 +1,28 @@
-# 1) exit old venv
+PY312="$(brew --prefix python@3.12)/bin/python3.12"
+echo "$PY312"
+"$PY312" -V
+
+
 deactivate 2>/dev/null || true
-
-# 2) install a supported python (pick one)
-brew install python@3.12
-
-# 3) recreate venv using python3.12 explicitly
 cd ~/Desktop/Projects/jan-1
+
+# delete the old python3.14 venv
 rm -rf smartopscli
-/opt/homebrew/opt/python@3.12/bin/python3.12 -m venv smartopscli
+
+
+
+"$PY312" -m venv smartopscli
 source smartopscli/bin/activate
 
-# 4) upgrade tooling inside venv
+
+
+python -V
+which python
+pip -V
+
+
+
 python -m pip install --upgrade pip setuptools wheel
 
-# 5) install SmartOps CLI
+
 pip install --no-cache-dir c1-smartops
