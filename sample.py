@@ -1,12 +1,27 @@
-# 1) Convert Spark DFs -> pandas (Comparison is already pandas)
-df_dict = {
-    "Conventional": rebate_conventional_df.toPandas(),
-    "TC": starrocks_rebate_df.toPandas(),
-    "Comparison": compared_rebate_df,  # already pandas
-}
+# 0) sanity
+which python3
+python3 -V
 
-# 2) Call your existing function (write to Workspace path via /dbfs mirror)
-export_file_name = f"Rebate_Conv_vs_TC_{uw_req_id}_{time_stamp()}.xlsx"
-export_path = "/dbfs/Workspace/Shared/QA Test Automation/True Cost/Rebate_Validation_Output"
+# 1) make sure pip exists for this python (only needed if pip is missing)
+python3 -m pip -V || python3 -m ensurepip --upgrade
 
-write_df_multiple_to_excel(export_file_name, export_path, df_dict)
+# 2) make sure your corporate pip index is configured (per your doc)
+mkdir -p ~/.config/pip
+cat > ~/.config/pip/pip.conf <<'EOF'
+[global]
+index-url = https://artifactory.cloud.capitalone.com/artifactory/api/pypi/pypi-internalfacing/simple
+# If TLS/proxy rules require it in your env, uncomment:
+# trusted-host = artifactory.cloud.capitalone.com
+EOF
+
+# 3) install virtualenv for THIS python
+python3 -m pip install --upgrade pip setuptools wheel
+python3 -m pip install --user virtualenv
+
+# 4) now the doc step will work
+python3 -m virtualenv smartopscli
+source smartopscli/bin/activate
+
+# 5) after activation, python will exist (inside the venv)
+which python
+python -V
