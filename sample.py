@@ -1,27 +1,17 @@
-# 0) sanity
-which python3
-python3 -V
+# 1) exit old venv
+deactivate 2>/dev/null || true
 
-# 1) make sure pip exists for this python (only needed if pip is missing)
-python3 -m pip -V || python3 -m ensurepip --upgrade
+# 2) install a supported python (pick one)
+brew install python@3.12
 
-# 2) make sure your corporate pip index is configured (per your doc)
-mkdir -p ~/.config/pip
-cat > ~/.config/pip/pip.conf <<'EOF'
-[global]
-index-url = https://artifactory.cloud.capitalone.com/artifactory/api/pypi/pypi-internalfacing/simple
-# If TLS/proxy rules require it in your env, uncomment:
-# trusted-host = artifactory.cloud.capitalone.com
-EOF
-
-# 3) install virtualenv for THIS python
-python3 -m pip install --upgrade pip setuptools wheel
-python3 -m pip install --user virtualenv
-
-# 4) now the doc step will work
-python3 -m virtualenv smartopscli
+# 3) recreate venv using python3.12 explicitly
+cd ~/Desktop/Projects/jan-1
+rm -rf smartopscli
+/opt/homebrew/opt/python@3.12/bin/python3.12 -m venv smartopscli
 source smartopscli/bin/activate
 
-# 5) after activation, python will exist (inside the venv)
-which python
-python -V
+# 4) upgrade tooling inside venv
+python -m pip install --upgrade pip setuptools wheel
+
+# 5) install SmartOps CLI
+pip install --no-cache-dir c1-smartops
