@@ -6,4 +6,5 @@ extract_regex cloudwatch_log, /program code\s+'?(?<program_code>[A-Za-z0-9_-]+)'
 
 filter not is_null(program_code)
 
-statsby ff_success_cnt: count(), group_by(program_code)
+statsby ff_success_cnt: count()
+group_by(program_code)
