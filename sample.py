@@ -2,35 +2,25 @@ import pandas as pd
 
 All_Revenue_Combined_NPGs = []
 
-def fetch_network_titles(network_ids):
-    """
-    Pull only needed network titles from artifactsdb_qa.network.
-    Returns df with columns: id, title
-    """
-    network_ids = [int(x) for x in network_ids if pd.notna(x)]
-    network_ids = sorted(set(network_ids))
-    if not network_ids:
-        return pd.DataFrame(columns=["id", "title"])
-
-    # Build a safe IN list (ids are ints)
-    in_list = ",".join(str(x) for x in network_ids)
-
-    q = f"""
-    SELECT id, title
-    FROM artifactsdb_qa.network
-    WHERE id IN ({in_list})
-    """
-    df = starrocksConnection_qa("artifactsdb_qa", q)
-
-    # Normalize types
-    if not df.empty:
-        df["id"] = pd.to_numeric(df["id"], errors="coerce").astype("Int64")
-    return df
-
+# We'll first collect all revenue dfs + all network ids, then do ONE artifactsdb lookup (faster + cleaner)
+_rev_dfs = []
+_all_network_ids = set()
 
 for pg in rev_base_dict:
-    year = int(pg["proj_year"])
 
+    # ---- keep your year-mapping logic (but store as INT for SQL) ----
+    if pg["proj_year"] == 0:
+        year = 0
+    elif pg["proj_year"] == 1:
+        year = 1
+    elif pg["proj_year"] == 2:
+        year = 2
+    elif pg["proj_year"] == 3:
+        year = 3
+    else:
+        year = int(pg["proj_year"])
+
+    # ---- Revenue query ONLY (no artifactsdb_qa references) ----
     revenue_q = f"""
     SELECT
         rs.uw_req_id,
@@ -119,36 +109,56 @@ for pg in rev_base_dict:
 
     rev_df = starrocksConnection_qa("comp_engine_microservice_qa", revenue_q)
 
-    # If empty, append as-is (still keeps pipeline consistent)
+    # Always keep list alignment
     if rev_df is None or len(rev_df) == 0:
-        All_Revenue_Combined_NPGs.append(rev_df)
+        _rev_dfs.append(pd.DataFrame())
         continue
 
-    # Normalize id columns to Int64 for joins
+    # Normalize ID columns so the Pandas join is stable
     for col in ["proj_network_id", "primary_ntwrk_id", "secondary_ntwrk_id"]:
         if col in rev_df.columns:
             rev_df[col] = pd.to_numeric(rev_df[col], errors="coerce").astype("Int64")
 
-    # Collect only needed network ids from this result
-    ids = set()
-    for c in ["proj_network_id", "primary_ntwrk_id", "secondary_ntwrk_id"]:
-        if c in rev_df.columns:
-            ids.update(rev_df[c].dropna().astype(int).tolist())
+    # Collect ids needed for artifacts lookup
+    for col in ["proj_network_id", "primary_ntwrk_id", "secondary_ntwrk_id"]:
+        if col in rev_df.columns:
+            vals = rev_df[col].dropna().astype(int).tolist()
+            _all_network_ids.update(vals)
 
-    net_df = fetch_network_titles(ids)
+    _rev_dfs.append(rev_df)
 
-    # Join titles three times (projected / primary / secondary)
-    # projected_network
-    tmp = net_df.rename(columns={"id": "proj_network_id", "title": "projected_network"})
-    out_df = rev_df.merge(tmp, on="proj_network_id", how="left")
 
-    # primary_network
-    tmp = net_df.rename(columns={"id": "primary_ntwrk_id", "title": "primary_network"})
-    out_df = out_df.merge(tmp, on="primary_ntwrk_id", how="left")
+# ---- Now lookup all network titles ONCE from artifactsdb_qa ----
+if _all_network_ids:
+    in_list = ",".join(str(x) for x in sorted(_all_network_ids))
+    net_q = f"""
+    SELECT id, title
+    FROM artifactsdb_qa.network
+    WHERE id IN ({in_list})
+    """
+    net_df = starrocksConnection_qa("artifactsdb_qa", net_q)
+else:
+    net_df = pd.DataFrame(columns=["id", "title"])
 
-    # secondary_network
-    tmp = net_df.rename(columns={"id": "secondary_ntwrk_id", "title": "secondary_network"})
-    out_df = out_df.merge(tmp, on="secondary_ntwrk_id", how="left")
+# Normalize net_df ids
+if net_df is None or len(net_df) == 0:
+    net_df = pd.DataFrame(columns=["id", "title"])
+else:
+    net_df["id"] = pd.to_numeric(net_df["id"], errors="coerce").astype("Int64")
+
+# ---- Enrich each revenue df with titles ----
+proj_map = net_df.rename(columns={"id": "proj_network_id", "title": "projected_network"})
+prim_map = net_df.rename(columns={"id": "primary_ntwrk_id", "title": "primary_network"})
+sec_map  = net_df.rename(columns={"id": "secondary_ntwrk_id", "title": "secondary_network"})
+
+for rev_df in _rev_dfs:
+    if rev_df is None or len(rev_df) == 0:
+        # Keep consistent output shape (optional)
+        All_Revenue_Combined_NPGs.append(rev_df)
+        continue
+
+    out_df = rev_df.merge(proj_map, on="proj_network_id", how="left")
+    out_df = out_df.merge(prim_map, on="primary_ntwrk_id", how="left")
+    out_df = out_df.merge(sec_map,  on="secondary_ntwrk_id", how="left")
 
     All_Revenue_Combined_NPGs.append(out_df)
-
