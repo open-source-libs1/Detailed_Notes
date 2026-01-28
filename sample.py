@@ -1,29 +1,10 @@
-SELECT
-  uw_req_id, proj_year,
-  network_pricing_group_id, rebate_pricing_group_id, srx_pricing_group_id,
-  network_guid, formulary_guid,
-  srx_arrangement_key, days_supply_key, brand_generic_key
-FROM comp_engine_microservice_output_qa.pricing_group_claims_agg
-WHERE uw_req_id = '<PUT_UW_REQ_ID>'
-LIMIT 20;
+filter asv = "ASVCARDREFERRALS"
+filter logGroup ~ "/aws/ecs/fargate/BACARDREFERRALS/fulfillment-incentive-processor-qa-us-.*"
+filter cloudwatch_log ~ "Successfully updated the customer status to FF under program code"
 
+extract_regex cloudwatch_log, /under program code\s+(?<program_code>[A-Za-z0-9_-]+)/
 
-/////
+filter not is_null(program_code)
 
-
-DESCRIBE comp_engine_microservice_qa.revenue;
-
-
-
-//////////
-
-
-SELECT COUNT(*) AS cnt
-FROM comp_engine_microservice_qa.revenue rs
-WHERE rs.uw_req_id = '<PUT_UW_REQ_ID>'
-  AND rs.proj_year = <PUT_YEAR>
-  AND rs.network_pricing_group_id = '<PUT_NPG_ID>'
-  AND rs.rebate_pricing_group_id  = '<PUT_RPG_ID>'
-  AND rs.srx_pricing_group_id     = '<PUT_SPG_ID>'
-  AND rs.network_guid             = '<PUT_NETWORK_GUID>'
-  AND rs.formulary_guid           = '<PUT_FORMULARY_GUID>';
+statsby Success_Count: count(), group_by(program_code)
+sort Success_Count
