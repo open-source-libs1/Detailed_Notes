@@ -1,112 +1,84 @@
+from collections import deque
 from contextlib import contextmanager
 
 @contextmanager
-def _noop_context(*args, **kwargs):
+def _noop_lock():
     yield
 
+from unittest.mock import ANY  # optional, only if you want flexible assertions
 
-class TestIncentiveProcessor(unittest.TestCase):
-    ...
-    # keep your existing setUp + tests unchanged
 
-    @patch('app.main.init_validate_context')
-    @patch('app.main.create_money_movement_request')
-    @patch('app.main.extract_json_body')
-    def test_process_payment_no_escid_calls_update_retry(
-        self, mock_extract_json, mock_create_request, mock_init_validate
-    ):
-        # Make context manager no-op
-        mock_init_validate.return_value = _noop_context()
-        mock_create_request.return_value = MagicMock()
+class TestMoneyMovementClient(unittest.TestCase):
+    # keep your existing setUp + existing tests unchanged
 
-        data = {
-            'customer_account_key': '123',
-            'customer_retry_count': 0,
-            'event_id': 'EVT-1',
-            'referral_code': 'RC-1',
-        }
+    @patch("app.services.money_movement.requests.post")
+    def test_make_post_request_cleans_old_timestamps(self, mock_post):
+        """
+        Covers the first cleanup loop:
+        while self._request_times and now - self._request_times[0] > 1:
+            popleft()
+        """
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.reason = "OK"
+        mock_response.text = '{"result":"success"}'
+        mock_post.return_value = mock_response
 
-        # Force: no ESCID
-        self.processor.tcr_client.get_account_escid.return_value = None
+        data = MagicMock()
+        data.moneyFlowRequestId = "reqid"
+        data.model_dump.return_value = {"some": "data"}
 
-        # Spy / stub retry + status functions
-        self.processor.update_retry = MagicMock()
-        self.processor.update_customer_status = MagicMock()
+        # Make TPS limit small and isolate request_times per test
+        with patch("app.services.money_movement.Constants.MMAPI_TPS_LIMIT", 2):
+            self.client._request_times = deque([0.0, 0.5], maxlen=2)  # both should be >1s old
+            self.client._lock = _noop_lock()  # avoid real threading lock behavior
 
-        self.processor.process_payment(data, 'customer', 100)
+            with patch("app.services.money_movement.time.time", return_value=2.0):
+                self.client.make_post_request("customer", data)
 
-        self.processor.update_retry.assert_called_once_with(data, 'customer')
-        self.processor.update_customer_status.assert_not_called()
-        self.processor.money_movement_client.make_post_request.assert_not_called()
+            # After cleanup both removed, then "now" appended => only one entry remains
+            self.assertEqual(list(self.client._request_times), [2.0])
 
-    @patch('app.main.init_validate_context')
-    @patch('app.main.create_money_movement_request')
-    @patch('app.main.extract_json_body')
-    def test_process_payment_duplicate_409_mmpc009_updates_status_ff(
-        self, mock_extract_json, mock_create_request, mock_init_validate
-    ):
-        mock_init_validate.return_value = _noop_context()
-        mock_create_request.return_value = MagicMock()
-        mock_extract_json.return_value = {}  # not used in 409/MMPC009 branch
+    @patch("app.services.money_movement.requests.post")
+    def test_make_post_request_hits_tps_limit_sleeps_and_recleans(self, mock_post):
+        """
+        Covers TPS limit block:
+        if len(self._request_times) >= Constants.MMAPI_TPS_LIMIT:
+            logger.info(...)
+            sleep_time = ...
+            time.sleep(...)
+            now = time.time()
+            while ...: popleft()
+        """
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.reason = "OK"
+        mock_response.text = '{"result":"success"}'
+        mock_post.return_value = mock_response
 
-        data = {
-            'customer_account_key': '123',
-            'customer_retry_count': 0,
-            'event_id': 'EVT-2',
-            'referral_code': 'RC-2',
-        }
+        data = MagicMock()
+        data.moneyFlowRequestId = "reqid"
+        data.model_dump.return_value = {"some": "data"}
 
-        self.processor.tcr_client.get_account_escid.return_value = "ESC123"
+        with patch("app.services.money_movement.Constants.MMAPI_TPS_LIMIT", 2):
+            # Pre-fill to the TPS limit so the throttle branch triggers
+            self.client._request_times = deque([0.0, 0.2], maxlen=2)
+            self.client._lock = _noop_lock()
 
-        mm_response = MagicMock()
-        mm_response.status_code = 409
-        mm_response.json.return_value = {'id': 'MMPC009'}
-        self.processor.money_movement_client.make_post_request.return_value = mm_response
+            with patch("app.services.money_movement.logger") as mock_logger, \
+                 patch("app.services.money_movement.time.sleep") as mock_sleep, \
+                 patch("app.services.money_movement.time.time", side_effect=[0.3, 1.05]):
 
-        self.processor.update_retry = MagicMock()
-        self.processor.update_customer_status = MagicMock()
+                # now=0.3 -> len==2 triggers throttle
+                # sleep_time = 1 - (0.3 - 0.0) = 0.7
+                self.client.make_post_request("customer", data)
 
-        self.processor.process_payment(data, 'customer', 100)
+                mock_logger.info.assert_any_call(
+                    "Money Movement TPS limit reached: 2, waiting..."
+                )
+                mock_sleep.assert_called_once_with(0.7)
 
-        # Must hit: update_customer_status(data, target, 'FF', amount=amount)
-        self.processor.update_customer_status.assert_called_once()
-        args, kwargs = self.processor.update_customer_status.call_args
-        self.assertEqual(args[0], data)
-        self.assertEqual(args[1], 'customer')
-        self.assertEqual(args[2], 'FF')
-        self.assertEqual(kwargs.get('amount'), 100)
-        self.processor.update_retry.assert_not_called()
+            # After second now=1.05, old 0.0 gets popped in the second cleanup,
+            # and 1.05 appended
+            self.assertEqual(list(self.client._request_times), [0.2, 1.05])
 
-    @patch('app.main.init_validate_context')
-    @patch('app.main.create_money_movement_request')
-    @patch('app.main.extract_json_body')
-    def test_process_payment_400_ful902_calls_update_retry(
-        self, mock_extract_json, mock_create_request, mock_init_validate
-    ):
-        mock_init_validate.return_value = _noop_context()
-        mock_create_request.return_value = MagicMock()
-
-        data = {
-            'customer_account_key': '123',
-            'customer_retry_count': 1,
-            'event_id': 'EVT-3',
-            'referral_code': 'RC-3',
-        }
-
-        self.processor.tcr_client.get_account_escid.return_value = "ESC999"
-
-        mm_response = MagicMock()
-        mm_response.status_code = 400
-        mm_response.json.return_value = {'id': 'ANY'}
-        self.processor.money_movement_client.make_post_request.return_value = mm_response
-
-        # Force: response_body.get('id') == 'FUL902'
-        mock_extract_json.return_value = {'id': 'FUL902'}
-
-        self.processor.update_retry = MagicMock()
-        self.processor.update_customer_status = MagicMock()
-
-        self.processor.process_payment(data, 'customer', 100)
-
-        self.processor.update_retry.assert_called_once_with(data, 'customer')
-        self.processor.update_customer_status.assert_not_called()
