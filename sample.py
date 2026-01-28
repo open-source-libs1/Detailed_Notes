@@ -1,1 +1,154 @@
+import pandas as pd
+
+All_Revenue_Combined_NPGs = []
+
+def fetch_network_titles(network_ids):
+    """
+    Pull only needed network titles from artifactsdb_qa.network.
+    Returns df with columns: id, title
+    """
+    network_ids = [int(x) for x in network_ids if pd.notna(x)]
+    network_ids = sorted(set(network_ids))
+    if not network_ids:
+        return pd.DataFrame(columns=["id", "title"])
+
+    # Build a safe IN list (ids are ints)
+    in_list = ",".join(str(x) for x in network_ids)
+
+    q = f"""
+    SELECT id, title
+    FROM artifactsdb_qa.network
+    WHERE id IN ({in_list})
+    """
+    df = starrocksConnection_qa("artifactsdb_qa", q)
+
+    # Normalize types
+    if not df.empty:
+        df["id"] = pd.to_numeric(df["id"], errors="coerce").astype("Int64")
+    return df
+
+
+for pg in rev_base_dict:
+    year = int(pg["proj_year"])
+
+    revenue_q = f"""
+    SELECT
+        rs.uw_req_id,
+        rs.network_pricing_group_id,
+        rs.rebate_pricing_group_id,
+        rs.srx_pricing_group_id,
+        rs.proj_year,
+
+        rs.proj_network_id,
+        rs.primary_ntwrk_id,
+        rs.secondary_ntwrk_id,
+        rs.tertiary_ntwrk_id,
+
+        rs.network_guid,
+        rs.formulary_guid,
+
+        CASE rs.{pg["brand_generic_key"]}
+            WHEN 1 THEN 'Generic'
+            ELSE 'Brand'
+        END AS Brand_Generic,
+
+        rs.mc,
+        rs.cstm_ntwk_ind,
+        rs.cop_ind,
+
+        CASE rs.{pg["srx_arrangement_key"]}
+            WHEN 1 THEN 'Retail'
+            WHEN 2 THEN 'Mail'
+            WHEN 3 THEN 'Specialty'
+            WHEN 4 THEN 'SRx at Retail'
+            ELSE 'NA'
+        END AS Channel,
+
+        CASE
+            WHEN rs.{pg["days_supply_key"]} = 1 OR rs.{pg["days_supply_key"]} = TRUE THEN 1
+            ELSE 0
+        END AS days_supply,
+
+        rs.cp_fin_sc_id,
+        rs.price_type_id,
+        rs.network_pref_ind_id,
+        rs.pharmacy_capped_noncapped_id,
+        rs.tag_paper_claims,
+        rs.tag_340b,
+        rs.tag_340b_clm,
+        rs.tag_340b_pharm,
+        rs.tag_340b_phmcy38,
+        rs.tag_340b_phmcy39,
+        rs.tag_340b_std_phmcy37,
+        rs.tag_340b_mfg_phmcy_discnt,
+        rs.tag_340b_phmcy38_scc20,
+        rs.tag_340b_phmcy39_scc20,
+        rs.tag_340b_ineligible,
+        rs.tag_340b_phmcy_w_scc20,
+        rs.tag_340b_phmcy38_phmcy39_w_scc20,
+        rs.tag_coordination_of_benefits,
+
+        SUM(rs.num_claims) AS NumClaims,
+        SUM(rs.awp_total) AS AWP_Total,
+        SUM(rs.acquisition_cost) AS Acquisition_Cost,
+        SUM(rs.cogs_trad_pbm_total) AS Cogs_Trad_PBM_Total,
+        SUM(rs.cogs_trans_pbm_total) AS Cogs_Trans_PBM_Total,
+        SUM(rs.cogs_dispns_fee_trad_pbm_total) AS Cogs_Dispns_Fee_Trad_PBM_Total,
+        SUM(rs.cogs_dispns_fee_trans_pbm_total) AS Cogs_Dispns_Fee_Trans_PBM_Total,
+        SUM(rs.cogs_trad_medi_total) AS Cogs_Trad_Medi_Total,
+        SUM(rs.cogs_trans_medi_total) AS Cogs_Trans_Medi_Total,
+        SUM(rs.cogs_dispns_fee_trad_medi_total) AS Cogs_Dispns_Fee_Trad_Medi_Total,
+        SUM(rs.cogs_dispns_fee_trans_medi_total) AS Cogs_Dispns_Fee_Trans_Medi_Total,
+        SUM(rs.mac_list_9) AS MAC_List_9,
+        SUM(rs.mac_list_10) AS MAC_List_10
+
+    FROM comp_engine_microservice_qa.revenue rs
+    WHERE rs.uw_req_id = '{pg["uw_req_id"]}'
+      AND rs.{pg["srx_arrangement_key"]} IN (1,2,3,4)
+      AND rs.proj_year = {year}
+      AND rs.network_pricing_group_id = '{pg["network_pricing_group_id"]}'
+      AND rs.rebate_pricing_group_id  = '{pg["rebate_pricing_group_id"]}'
+      AND rs.srx_pricing_group_id     = '{pg["srx_pricing_group_id"]}'
+      AND rs.network_guid             = '{pg["network_guid"]}'
+      AND rs.formulary_guid           = '{pg["formulary_guid"]}'
+
+    GROUP BY 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,
+             21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37
+    ORDER BY 5,12,16
+    """
+
+    rev_df = starrocksConnection_qa("comp_engine_microservice_qa", revenue_q)
+
+    # If empty, append as-is (still keeps pipeline consistent)
+    if rev_df is None or len(rev_df) == 0:
+        All_Revenue_Combined_NPGs.append(rev_df)
+        continue
+
+    # Normalize id columns to Int64 for joins
+    for col in ["proj_network_id", "primary_ntwrk_id", "secondary_ntwrk_id"]:
+        if col in rev_df.columns:
+            rev_df[col] = pd.to_numeric(rev_df[col], errors="coerce").astype("Int64")
+
+    # Collect only needed network ids from this result
+    ids = set()
+    for c in ["proj_network_id", "primary_ntwrk_id", "secondary_ntwrk_id"]:
+        if c in rev_df.columns:
+            ids.update(rev_df[c].dropna().astype(int).tolist())
+
+    net_df = fetch_network_titles(ids)
+
+    # Join titles three times (projected / primary / secondary)
+    # projected_network
+    tmp = net_df.rename(columns={"id": "proj_network_id", "title": "projected_network"})
+    out_df = rev_df.merge(tmp, on="proj_network_id", how="left")
+
+    # primary_network
+    tmp = net_df.rename(columns={"id": "primary_ntwrk_id", "title": "primary_network"})
+    out_df = out_df.merge(tmp, on="primary_ntwrk_id", how="left")
+
+    # secondary_network
+    tmp = net_df.rename(columns={"id": "secondary_ntwrk_id", "title": "secondary_network"})
+    out_df = out_df.merge(tmp, on="secondary_ntwrk_id", how="left")
+
+    All_Revenue_Combined_NPGs.append(out_df)
 
