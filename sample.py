@@ -1,268 +1,177 @@
-# =========================
-# Cell 11 (copy/paste)
-# =========================
 from pyspark.sql import functions as F
-from pyspark.sql import DataFrame as SparkDF
 
-# --- helpers ---
-def _is_true(v):
-    return str(v).strip().lower() in ("true", "1", "yes", "y")
+def _boolish(v):
+    # handles True/False, "true"/"false", 1/0, "1"/"0"
+    if v is None:
+        return False
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    return s in ("true", "1", "yes", "y")
+
+def _sql_quote(v):
+    # safe for GUID-like strings
+    if v is None:
+        return ""
+    return str(v).replace("'", "''")
+
+def _safe_and(extra_sql):
+    # allow pg['excl_*'] to be None/"None"/""; otherwise prefix with AND if not already
+    if extra_sql is None:
+        return ""
+    s = str(extra_sql).strip()
+    if s == "" or s.lower() == "none":
+        return ""
+    return s if s.lower().lstrip().startswith("and ") else f"AND {s}"
 
 def _is_empty_df(df):
-    if df is None:
-        return True
-    if isinstance(df, SparkDF):
-        # Spark-safe "is empty" (action)
-        return df.rdd.isEmpty()
-    # pandas fallback (if your connector ever returns pandas)
-    return getattr(df, "empty", False) or (hasattr(df, "__len__") and len(df) == 0)
+    # Spark-safe emptiness check
+    return (df is None) or df.rdd.isEmpty()
 
-def _safe_and(filter_sql):
-    """
-    Your rev_base_dict has strings like pg['excl_retail'] / pg['excl_mail'].
-    If they are empty/None -> no-op.
-    If they already include leading AND, we won't double it.
-    """
-    if not filter_sql:
-        return ""
-    s = str(filter_sql).strip()
-    if not s:
-        return ""
-    if s.lower().startswith("and "):
-        return f"\n{s}"
-    return f"\nAND {s}"
+def build_revenue_query(pg, srx_arr_in, channel_label, extra_filter_sql=None):
+    # IMPORTANT: these are column names in rs; your dict seems to store the names
+    brand_col = pg.get("brand_generic_key", "brand_generic_key")
+    srx_col   = pg.get("srx_arrangement_key", "srx_arrangement_key")
+    days_col  = pg.get("days_supply_key", "days_supply_key")
 
-def _chunked(iterable, size=5000):
-    buf = []
-    for x in iterable:
-        buf.append(x)
-        if len(buf) >= size:
-            yield buf
-            buf = []
-    if buf:
-        yield buf
+    # year is numeric in DB; keep it numeric
+    year_val = int(pg.get("proj_year", 0))
 
-def build_revenue_query(pg, channel_name, srx_arr_in, extra_filter_sql=""):
-    """
-    Revenue query ONLY hits: comp_engine_microservice_qa.revenue rs
-    We do NOT join artifactsdb here. We'll join titles later.
-    """
-    uw_req_id = pg["uw_req_id"]
-    proj_year = int(pg["proj_year"])
-    npg = pg["network_pricing_group_id"]
-    rpg = pg["rebate_pricing_group_id"]
-    spg = pg["srx_pricing_group_id"]
-    network_guid = pg["network_guid"]
-    formulary_guid = pg["formulary_guid"]
+    uw_req_id = _sql_quote(pg.get("uw_req_id"))
+    npg_id    = _sql_quote(pg.get("network_pricing_group_id"))
+    rpg_id    = _sql_quote(pg.get("rebate_pricing_group_id"))
+    srxpg_id  = _sql_quote(pg.get("srx_pricing_group_id"))
+    net_guid  = _sql_quote(pg.get("network_guid"))
+    form_guid = _sql_quote(pg.get("formulary_guid"))
 
-    # These two are constants per pg; keeping them as literals prevents GROUP BY mistakes
-    brand_generic_key = int(pg.get("brand_generic_key", 0) or 0)
-    days_supply_key = int(_is_true(pg.get("days_supply_key", False)))
+    srx_list_sql = ",".join(str(int(x)) for x in srx_arr_in)
 
-    # IMPORTANT: cast string ids to VARCHAR so Spark doesn't show them as binary
-    # IMPORTANT: group by explicit column names (not positions)
     q = f"""
-SELECT
-  CAST(rs.uw_req_id AS VARCHAR(32))                      AS uw_req_id,
-  CAST(rs.network_pricing_group_id AS VARCHAR(32))       AS network_pricing_group_id,
-  CAST(rs.rebate_pricing_group_id AS VARCHAR(32))        AS rebate_pricing_group_id,
-  CAST(rs.srx_pricing_group_id AS VARCHAR(32))           AS srx_pricing_group_id,
+    SELECT
+        rs.uw_req_id,
+        rs.network_pricing_group_id,
+        rs.rebate_pricing_group_id,
+        rs.srx_pricing_group_id,
+        rs.proj_year,
+        rs.proj_network_id,  n.title  AS projected_network,
+        rs.primary_ntwrk_id, pn.title AS primary_network,
+        rs.secondary_ntwrk_id, sn.title AS secondary_network,
+        rs.tertiary_ntwrk_id,
+        rs.network_guid,
+        rs.formulary_guid,
 
-  CAST(rs.proj_year AS INT)                              AS proj_year,
-  CAST(rs.proj_network_id AS BIGINT)                     AS proj_network_id,
-  CAST(rs.primary_ntwrk_id AS BIGINT)                    AS primary_ntwrk_id,
-  CAST(rs.secondary_ntwrk_id AS BIGINT)                  AS secondary_ntwrk_id,
-  CAST(rs.tertiary_ntwrk_id AS BIGINT)                   AS tertiary_ntwrk_id,
+        CASE rs.{brand_col}
+            WHEN 1 THEN 'Generic'
+            ELSE 'Brand'
+        END AS Brand_Generic,
 
-  CAST(rs.network_guid AS VARCHAR(32))                   AS network_guid,
-  CAST(rs.formulary_guid AS VARCHAR(32))                 AS formulary_guid,
+        rs.mc,
+        rs.cstm_ntwk_ind,
+        rs.cop_ind,
 
-  CASE WHEN {brand_generic_key} = 1 THEN 'Generic' ELSE 'Brand' END AS Brand_Generic,
-  CAST(rs.mc AS TINYINT)                                 AS mc,
-  CAST(rs.cstm_ntwk_ind AS INT)                          AS cstm_ntwk_ind,
-  CAST(rs.cop_ind AS INT)                                AS cop_ind,
+        CASE rs.{srx_col}
+            WHEN 1 THEN 'Retail'
+            WHEN 2 THEN 'Mail'
+            WHEN 3 THEN 'Specialty'
+            WHEN 4 THEN 'SRx at Retail'
+            ELSE 'NA'
+        END AS Channel,
 
-  '{channel_name}'                                       AS Channel,
-  {days_supply_key}                                      AS days_supply,
+        CASE rs.{days_col}
+            WHEN 1 THEN 1
+            ELSE 0
+        END AS days_supply,
 
-  CAST(rs.cp_fin_sc_id AS VARCHAR(50))                   AS cp_fin_sc_id,
-  CAST(rs.price_type_id AS INT)                          AS price_type_id,
-  CAST(rs.network_pref_ind_id AS INT)                    AS network_pref_ind_id,
-  CAST(rs.pharmacy_group_id AS INT)                      AS pharmacy_group_id,
-  CAST(rs.pharmacy_capped_noncappped_id AS INT)          AS pharmacy_capped_noncappped_id,
+        rs.cp_fin_sc_id,
+        rs.price_type_id,
+        rs.network_pref_ind_id,
+        rs.pharmacy_group_id,
+        rs.pharmacy_capped_noncapped_id,
 
-  -- measures
-  SUM(rs.num_claims)                      AS NumClaims,
-  SUM(rs.awp_total)                       AS AWP_Total,
-  SUM(rs.acquisition_cost)                AS Acquisition_Cost,
+        SUM(rs.num_claims)           AS NumClaims,
+        SUM(rs.awp_total)            AS AWP_Total,
+        SUM(rs.acquisition_cost)     AS Acquisition_Cost,
+        SUM(rs.cogs_trad_pbm_total)  AS Cogs_Trad_PBM_Total,
+        SUM(rs.cogs_trans_pbm_total) AS Cogs_Trans_PBM_Total,
+        SUM(rs.cogs_dispns_fee_trad_pbm_total)  AS Cogs_Dispns_Fee_Trad_PBM_Total,
+        SUM(rs.cogs_dispns_fee_trans_pbm_total) AS Cogs_Dispns_Fee_Trans_PBM_Total,
+        SUM(rs.cogs_trad_medi_total)            AS Cogs_Trad_Medi_Total,
+        SUM(rs.cogs_trans_medi_total)           AS Cogs_Trans_Medi_Total,
+        SUM(rs.cogs_dispns_fee_trad_medi_total) AS Cogs_Dispns_Fee_Trad_Medi_Total,
+        SUM(rs.cogs_dispns_fee_trans_medi_total)AS Cogs_Dispns_Fee_Trans_Medi_Total,
+        SUM(rs.mac_list_9)           AS MAC_List_9,
+        SUM(rs.mac_list_10)          AS MAC_List_10
 
-  SUM(rs.cogs_trad_pbm_total)             AS Cogs_Trad_PBM_Total,
-  SUM(rs.cogs_trans_pbm_total)            AS Cogs_Trans_PBM_Total,
-  SUM(rs.cogs_dispns_fee_trad_pbm_total)  AS Cogs_Dispns_Fee_Trad_PBM_Total,
-  SUM(rs.cogs_dispns_fee_trans_pbm_total) AS Cogs_Dispns_Fee_Trans_PBM_Total,
+    FROM comp_engine_microservice_qa.revenue rs
+    LEFT JOIN artifactsdb_qa.network n  ON rs.proj_network_id     = n.id
+    LEFT JOIN artifactsdb_qa.network sn ON rs.secondary_ntwrk_id  = sn.id
+    LEFT JOIN artifactsdb_qa.network pn ON rs.primary_ntwrk_id    = pn.id
 
-  SUM(rs.cogs_trad_medi_total)            AS Cogs_Trad_Medi_Total,
-  SUM(rs.cogs_trans_medi_total)           AS Cogs_Trans_Medi_Total,
-  SUM(rs.cogs_dispns_fee_trad_medi_total) AS Cogs_Dispns_Fee_Trad_Medi_Total,
-  SUM(rs.cogs_dispns_fee_trans_medi_total)AS Cogs_Dispns_Fee_Trans_Medi_Total,
+    WHERE rs.uw_req_id = '{uw_req_id}'
+      AND rs.{srx_col} IN ({srx_list_sql})
+      AND rs.proj_year = {year_val}
+      AND rs.network_pricing_group_id = '{npg_id}'
+      AND rs.rebate_pricing_group_id  = '{rpg_id}'
+      AND rs.srx_pricing_group_id     = '{srxpg_id}'
+      AND rs.network_guid   = '{net_guid}'
+      AND rs.formulary_guid = '{form_guid}'
+      {_safe_and(extra_filter_sql)}
 
-  SUM(rs.mac_list_9)                      AS MAC_List_9,
-  SUM(rs.mac_list_10)                     AS MAC_List_10
-
-FROM comp_engine_microservice_qa.revenue rs
-WHERE rs.uw_req_id = '{uw_req_id}'
-  AND rs.srx_arrangement_key IN ({",".join(str(x) for x in srx_arr_in)})
-  AND rs.proj_year = {proj_year}
-  AND rs.network_pricing_group_id = '{npg}'
-  AND rs.rebate_pricing_group_id  = '{rpg}'
-  AND rs.srx_pricing_group_id     = '{spg}'
-  AND rs.network_guid             = '{network_guid}'
-  AND rs.formulary_guid           = '{formulary_guid}'
-  {extra_filter_sql}
-
-GROUP BY
-  CAST(rs.uw_req_id AS VARCHAR(32)),
-  CAST(rs.network_pricing_group_id AS VARCHAR(32)),
-  CAST(rs.rebate_pricing_group_id AS VARCHAR(32)),
-  CAST(rs.srx_pricing_group_id AS VARCHAR(32)),
-
-  CAST(rs.proj_year AS INT),
-  CAST(rs.proj_network_id AS BIGINT),
-  CAST(rs.primary_ntwrk_id AS BIGINT),
-  CAST(rs.secondary_ntwrk_id AS BIGINT),
-  CAST(rs.tertiary_ntwrk_id AS BIGINT),
-
-  CAST(rs.network_guid AS VARCHAR(32)),
-  CAST(rs.formulary_guid AS VARCHAR(32)),
-
-  CAST(rs.mc AS TINYINT),
-  CAST(rs.cstm_ntwk_ind AS INT),
-  CAST(rs.cop_ind AS INT),
-
-  CAST(rs.cp_fin_sc_id AS VARCHAR(50)),
-  CAST(rs.price_type_id AS INT),
-  CAST(rs.network_pref_ind_id AS INT),
-  CAST(rs.pharmacy_group_id AS INT),
-  CAST(rs.pharmacy_capped_noncappped_id AS INT)
-
-ORDER BY proj_year, network_pricing_group_id, Channel
-"""
+    GROUP BY 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25
+    ORDER BY 5,12,16
+    """
     return q
 
-def fetch_network_titles(all_ids):
-    """
-    Pull titles from artifactsdb_qa.network for ids in all_ids (chunked).
-    Returns a Spark DF with [id, title]
-    """
-    ids = sorted({int(x) for x in all_ids if x is not None})
-    if not ids:
-        return None
+def run_rev_query(label, query):
+    # optional: print(label, query) if you want to debug SQL text
+    df = starrocksConnection_qa("comp_engine_microservice_qa", query)
 
-    dfs = []
-    for chunk in _chunked(ids, size=5000):
-        in_list = ",".join(str(i) for i in chunk)
-        q = f"""
-        SELECT CAST(id AS BIGINT) AS id, title
-        FROM artifactsdb_qa.network
-        WHERE id IN ({in_list})
-        """
-        d = starrocksConnection_qa("artifactsdb_qa", q)
-        if not _is_empty_df(d):
-            dfs.append(d)
-
-    if not dfs:
-        return None
-
-    out = dfs[0]
-    for d in dfs[1:]:
-        out = out.unionByName(d, allowMissingColumns=True)
-    return out.dropDuplicates(["id"])
-
-def attach_network_titles(df, net_df):
-    """
-    Adds projected_network / primary_network / secondary_network by joining net_df 3 times.
-    """
-    if _is_empty_df(df) or _is_empty_df(net_df):
-        return df
-
-    # Ensure join key types match
-    df = (df
-          .withColumn("proj_network_id", F.col("proj_network_id").cast("long"))
-          .withColumn("primary_ntwrk_id", F.col("primary_ntwrk_id").cast("long"))
-          .withColumn("secondary_ntwrk_id", F.col("secondary_ntwrk_id").cast("long"))
-          .withColumn("tertiary_ntwrk_id", F.col("tertiary_ntwrk_id").cast("long"))
-    )
-
-    n = F.broadcast(net_df.select(F.col("id").cast("long").alias("nid"), F.col("title").alias("ntitle")))
-
-    df = (df
-          .join(n.withColumnRenamed("nid", "proj_network_id").withColumnRenamed("ntitle", "projected_network"),
-                on="proj_network_id", how="left")
-          .join(n.withColumnRenamed("nid", "primary_ntwrk_id").withColumnRenamed("ntitle", "primary_network"),
-                on="primary_ntwrk_id", how="left")
-          .join(n.withColumnRenamed("nid", "secondary_ntwrk_id").withColumnRenamed("ntitle", "secondary_network"),
-                on="secondary_ntwrk_id", how="left")
-    )
-
+    # normalize a couple of types that often come back weird in JDBC
+    if df is not None and "uw_req_id" in df.columns:
+        df = df.withColumn("uw_req_id", F.col("uw_req_id").cast("string"))
     return df
 
-# =========================
-# MAIN LOGIC (rev_base_dict -> Revenue_Combined_NPGs)
-# =========================
 Revenue_Combined_NPGs = []
-_all_network_ids = set()
 
 for pg in rev_base_dict:
-    # ---- retail query (srx_arrangement_key IN (1,3)) ----
+    # 1) Retail (1,3)
     retail_q = build_revenue_query(
         pg=pg,
-        channel_name="Retail",
         srx_arr_in=[1, 3],
-        extra_filter_sql=_safe_and(pg.get("excl_retail"))
+        channel_label="Retail",
+        extra_filter_sql=pg.get("excl_retail")
     )
-    retail_df = starrocksConnection_qa("comp_engine_microservice_qa", retail_q)
+    retail_df = run_rev_query("retail", retail_q)
     if not _is_empty_df(retail_df):
         Revenue_Combined_NPGs.append(retail_df)
-        _all_network_ids.update([r["proj_network_id"] for r in retail_df.select("proj_network_id").distinct().collect() if r["proj_network_id"] is not None])
-        _all_network_ids.update([r["primary_ntwrk_id"] for r in retail_df.select("primary_ntwrk_id").distinct().collect() if r["primary_ntwrk_id"] is not None])
-        _all_network_ids.update([r["secondary_ntwrk_id"] for r in retail_df.select("secondary_ntwrk_id").distinct().collect() if r["secondary_ntwrk_id"] is not None])
 
-    # ---- mail query (srx_arrangement_key IN (2)) ----
+    # 2) SRx_at_Retail (4) — run only when your dict says so
+    # Your screenshots show: if pg["srx_at_retail"] == 'false' then run SRx retail
+    if str(pg.get("srx_at_retail", "")).strip().lower() == "false":
+        srx_retail_q = build_revenue_query(
+            pg=pg,
+            srx_arr_in=[4],
+            channel_label="SRx at Retail",
+            extra_filter_sql=pg.get("excl_retail")  # adjust if you have a separate excl_srx_retail
+        )
+        srx_retail_df = run_rev_query("srx_retail", srx_retail_q)
+        if not _is_empty_df(srx_retail_df):
+            Revenue_Combined_NPGs.append(srx_retail_df)
+
+    # 3) Mail (2)
     mail_q = build_revenue_query(
         pg=pg,
-        channel_name="Mail",
         srx_arr_in=[2],
-        extra_filter_sql=_safe_and(pg.get("excl_mail"))
+        channel_label="Mail",
+        extra_filter_sql=pg.get("excl_mail")
     )
-    mail_df = starrocksConnection_qa("comp_engine_microservice_qa", mail_q)
+    mail_df = run_rev_query("mail", mail_q)
     if not _is_empty_df(mail_df):
         Revenue_Combined_NPGs.append(mail_df)
-        _all_network_ids.update([r["proj_network_id"] for r in mail_df.select("proj_network_id").distinct().collect() if r["proj_network_id"] is not None])
-        _all_network_ids.update([r["primary_ntwrk_id"] for r in mail_df.select("primary_ntwrk_id").distinct().collect() if r["primary_ntwrk_id"] is not None])
-        _all_network_ids.update([r["secondary_ntwrk_id"] for r in mail_df.select("secondary_ntwrk_id").distinct().collect() if r["secondary_ntwrk_id"] is not None])
 
-    # ---- SRx at Retail query (srx_arrangement_key IN (4)) only when pg['srx_at_retail'] is false ----
-    if not _is_true(pg.get("srx_at_retail")):
-        srx_q = build_revenue_query(
-            pg=pg,
-            channel_name="SRx at Retail",
-            srx_arr_in=[4],
-            extra_filter_sql=""  # add pg.get("excl_srx_retail") if you have one
-        )
-        srx_df = starrocksConnection_qa("comp_engine_microservice_qa", srx_q)
-        if not _is_empty_df(srx_df):
-            Revenue_Combined_NPGs.append(srx_df)
-            _all_network_ids.update([r["proj_network_id"] for r in srx_df.select("proj_network_id").distinct().collect() if r["proj_network_id"] is not None])
-            _all_network_ids.update([r["primary_ntwrk_id"] for r in srx_df.select("primary_ntwrk_id").distinct().collect() if r["primary_ntwrk_id"] is not None])
-            _all_network_ids.update([r["secondary_ntwrk_id"] for r in srx_df.select("secondary_ntwrk_id").distinct().collect() if r["secondary_ntwrk_id"] is not None])
-
-# ---- fetch titles once, then attach to each DF ----
-net_df = fetch_network_titles(_all_network_ids)
-
-Revenue_Combined_NPGs = [attach_network_titles(d, net_df) for d in Revenue_Combined_NPGs]
-
-# If you want one combined DF:
+# OPTIONAL: one combined DF
 # from functools import reduce
-# final_df = reduce(lambda a,b: a.unionByName(b, allowMissingColumns=True), Revenue_Combined_NPGs) if Revenue_Combined_NPGs else None
+# final_df = reduce(lambda a, b: a.unionByName(b, allowMissingColumns=True), Revenue_Combined_NPGs)
 # display(final_df)
 
+Revenue_Combined_NPGs
