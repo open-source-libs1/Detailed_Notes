@@ -1,177 +1,316 @@
-from pyspark.sql import functions as F
+from datetime import date, datetime
+import os
+import boto3
+from aws_lambda_powertools import Logger
 
-def _boolish(v):
-    # handles True/False, "true"/"false", 1/0, "1"/"0"
-    if v is None:
-        return False
-    if isinstance(v, bool):
-        return v
-    s = str(v).strip().lower()
-    return s in ("true", "1", "yes", "y")
+from aws_util import push_records_to_kinesis
+from db_util import get_fulfillment_event_for_onestream
+from onestream_util import CustomerReferralsFulfillmentActivityV1
 
-def _sql_quote(v):
-    # safe for GUID-like strings
-    if v is None:
-        return ""
-    return str(v).replace("'", "''")
+logger = Logger(service="FulfillmentApi", child=True)
+kinesis = boto3.client("kinesis")
 
-def _safe_and(extra_sql):
-    # allow pg['excl_*'] to be None/"None"/""; otherwise prefix with AND if not already
-    if extra_sql is None:
-        return ""
-    s = str(extra_sql).strip()
-    if s == "" or s.lower() == "none":
-        return ""
-    return s if s.lower().lstrip().startswith("and ") else f"AND {s}"
 
-def _is_empty_df(df):
-    # Spark-safe emptiness check
-    return (df is None) or df.rdd.isEmpty()
+def _fetch_data(connection, event_id: str, data: dict | None) -> dict | None:
+    if data:
+        return data
 
-def build_revenue_query(pg, srx_arr_in, channel_label, extra_filter_sql=None):
-    # IMPORTANT: these are column names in rs; your dict seems to store the names
-    brand_col = pg.get("brand_generic_key", "brand_generic_key")
-    srx_col   = pg.get("srx_arrangement_key", "srx_arrangement_key")
-    days_col  = pg.get("days_supply_key", "days_supply_key")
+    try:
+        data = get_fulfillment_event_for_onestream(connection, event_id)
+    except Exception as e:
+        logger.error("Failed to get fulfillment event for OneStream: %s", str(e))
+        return None
 
-    # year is numeric in DB; keep it numeric
-    year_val = int(pg.get("proj_year", 0))
+    if not data:
+        logger.error("No data found for event ID: %s", event_id)
+        return None
 
-    uw_req_id = _sql_quote(pg.get("uw_req_id"))
-    npg_id    = _sql_quote(pg.get("network_pricing_group_id"))
-    rpg_id    = _sql_quote(pg.get("rebate_pricing_group_id"))
-    srxpg_id  = _sql_quote(pg.get("srx_pricing_group_id"))
-    net_guid  = _sql_quote(pg.get("network_guid"))
-    form_guid = _sql_quote(pg.get("formulary_guid"))
+    return data
 
-    srx_list_sql = ",".join(str(int(x)) for x in srx_arr_in)
 
-    q = f"""
-    SELECT
-        rs.uw_req_id,
-        rs.network_pricing_group_id,
-        rs.rebate_pricing_group_id,
-        rs.srx_pricing_group_id,
-        rs.proj_year,
-        rs.proj_network_id,  n.title  AS projected_network,
-        rs.primary_ntwrk_id, pn.title AS primary_network,
-        rs.secondary_ntwrk_id, sn.title AS secondary_network,
-        rs.tertiary_ntwrk_id,
-        rs.network_guid,
-        rs.formulary_guid,
+def _map_to_schema(data: dict, event_id: str) -> CustomerReferralsFulfillmentActivityV1 | None:
+    try:
+        data["referral_event_id"] = data.get("event_id", event_id)
+        data["origination_correlation_id"] = data.get("correlation_id")
+        data["origination_tenant_id"] = data.get("tenant_id")
+        data["creation_utc_timestamp"] = data.get("creation_timestamp")
+        data["last_updated_utc_timestamp"] = data.get("last_updated_timestamp")
+        return CustomerReferralsFulfillmentActivityV1(**data)
+    except Exception as e:
+        logger.error("Failed to map to OneStream schema: %s", str(e))
+        return None
 
-        CASE rs.{brand_col}
-            WHEN 1 THEN 'Generic'
-            ELSE 'Brand'
-        END AS Brand_Generic,
 
-        rs.mc,
-        rs.cstm_ntwk_ind,
-        rs.cop_ind,
-
-        CASE rs.{srx_col}
-            WHEN 1 THEN 'Retail'
-            WHEN 2 THEN 'Mail'
-            WHEN 3 THEN 'Specialty'
-            WHEN 4 THEN 'SRx at Retail'
-            ELSE 'NA'
-        END AS Channel,
-
-        CASE rs.{days_col}
-            WHEN 1 THEN 1
-            ELSE 0
-        END AS days_supply,
-
-        rs.cp_fin_sc_id,
-        rs.price_type_id,
-        rs.network_pref_ind_id,
-        rs.pharmacy_group_id,
-        rs.pharmacy_capped_noncapped_id,
-
-        SUM(rs.num_claims)           AS NumClaims,
-        SUM(rs.awp_total)            AS AWP_Total,
-        SUM(rs.acquisition_cost)     AS Acquisition_Cost,
-        SUM(rs.cogs_trad_pbm_total)  AS Cogs_Trad_PBM_Total,
-        SUM(rs.cogs_trans_pbm_total) AS Cogs_Trans_PBM_Total,
-        SUM(rs.cogs_dispns_fee_trad_pbm_total)  AS Cogs_Dispns_Fee_Trad_PBM_Total,
-        SUM(rs.cogs_dispns_fee_trans_pbm_total) AS Cogs_Dispns_Fee_Trans_PBM_Total,
-        SUM(rs.cogs_trad_medi_total)            AS Cogs_Trad_Medi_Total,
-        SUM(rs.cogs_trans_medi_total)           AS Cogs_Trans_Medi_Total,
-        SUM(rs.cogs_dispns_fee_trad_medi_total) AS Cogs_Dispns_Fee_Trad_Medi_Total,
-        SUM(rs.cogs_dispns_fee_trans_medi_total)AS Cogs_Dispns_Fee_Trans_Medi_Total,
-        SUM(rs.mac_list_9)           AS MAC_List_9,
-        SUM(rs.mac_list_10)          AS MAC_List_10
-
-    FROM comp_engine_microservice_qa.revenue rs
-    LEFT JOIN artifactsdb_qa.network n  ON rs.proj_network_id     = n.id
-    LEFT JOIN artifactsdb_qa.network sn ON rs.secondary_ntwrk_id  = sn.id
-    LEFT JOIN artifactsdb_qa.network pn ON rs.primary_ntwrk_id    = pn.id
-
-    WHERE rs.uw_req_id = '{uw_req_id}'
-      AND rs.{srx_col} IN ({srx_list_sql})
-      AND rs.proj_year = {year_val}
-      AND rs.network_pricing_group_id = '{npg_id}'
-      AND rs.rebate_pricing_group_id  = '{rpg_id}'
-      AND rs.srx_pricing_group_id     = '{srxpg_id}'
-      AND rs.network_guid   = '{net_guid}'
-      AND rs.formulary_guid = '{form_guid}'
-      {_safe_and(extra_filter_sql)}
-
-    GROUP BY 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25
-    ORDER BY 5,12,16
-    """
-    return q
-
-def run_rev_query(label, query):
-    # optional: print(label, query) if you want to debug SQL text
-    df = starrocksConnection_qa("comp_engine_microservice_qa", query)
-
-    # normalize a couple of types that often come back weird in JDBC
-    if df is not None and "uw_req_id" in df.columns:
-        df = df.withColumn("uw_req_id", F.col("uw_req_id").cast("string"))
-    return df
-
-Revenue_Combined_NPGs = []
-
-for pg in rev_base_dict:
-    # 1) Retail (1,3)
-    retail_q = build_revenue_query(
-        pg=pg,
-        srx_arr_in=[1, 3],
-        channel_label="Retail",
-        extra_filter_sql=pg.get("excl_retail")
+def _build_onestream_payload(schema_obj: CustomerReferralsFulfillmentActivityV1) -> dict:
+    domain_payload = (
+        CustomerReferralsFulfillmentActivityV1.model_validate(schema_obj)
+        .model_dump(exclude_none=True)
     )
-    retail_df = run_rev_query("retail", retail_q)
-    if not _is_empty_df(retail_df):
-        Revenue_Combined_NPGs.append(retail_df)
 
-    # 2) SRx_at_Retail (4) — run only when your dict says so
-    # Your screenshots show: if pg["srx_at_retail"] == 'false' then run SRx retail
-    if str(pg.get("srx_at_retail", "")).strip().lower() == "false":
-        srx_retail_q = build_revenue_query(
-            pg=pg,
-            srx_arr_in=[4],
-            channel_label="SRx at Retail",
-            extra_filter_sql=pg.get("excl_retail")  # adjust if you have a separate excl_srx_retail
+    # Normalize date/datetime to isoformat
+    if isinstance(domain_payload.get("creation_utc_timestamp"), datetime):
+        domain_payload["creation_utc_timestamp"] = domain_payload["creation_utc_timestamp"].isoformat(
+            sep=" ", timespec="milliseconds"
         )
-        srx_retail_df = run_rev_query("srx_retail", srx_retail_q)
-        if not _is_empty_df(srx_retail_df):
-            Revenue_Combined_NPGs.append(srx_retail_df)
+    if isinstance(domain_payload.get("last_updated_utc_timestamp"), datetime):
+        domain_payload["last_updated_utc_timestamp"] = domain_payload["last_updated_utc_timestamp"].isoformat(
+            sep=" ", timespec="milliseconds"
+        )
+    if isinstance(domain_payload.get("customer_fulfillment_date"), date):
+        domain_payload["customer_fulfillment_date"] = domain_payload["customer_fulfillment_date"].isoformat()
+    if isinstance(domain_payload.get("prospect_fulfillment_date"), date):
+        domain_payload["prospect_fulfillment_date"] = domain_payload["prospect_fulfillment_date"].isoformat()
 
-    # 3) Mail (2)
-    mail_q = build_revenue_query(
-        pg=pg,
-        srx_arr_in=[2],
-        channel_label="Mail",
-        extra_filter_sql=pg.get("excl_mail")
-    )
-    mail_df = run_rev_query("mail", mail_q)
-    if not _is_empty_df(mail_df):
-        Revenue_Combined_NPGs.append(mail_df)
+    # Normalize amounts to string
+    if "customer_fulfilled_amount" in domain_payload:
+        domain_payload["customer_fulfilled_amount"] = str(domain_payload["customer_fulfilled_amount"])
+    if "prospect_fulfilled_amount" in domain_payload:
+        domain_payload["prospect_fulfilled_amount"] = str(domain_payload["prospect_fulfilled_amount"])
 
-# OPTIONAL: one combined DF
-# from functools import reduce
-# final_df = reduce(lambda a, b: a.unionByName(b, allowMissingColumns=True), Revenue_Combined_NPGs)
-# display(final_df)
+    return {
+        "schemaName": os.environ.get("ONESTREAM_SCHEMA_NAME", "customer_referral_fulfillment_activity"),
+        "domainPayload": domain_payload,
+    }
 
-Revenue_Combined_NPGs
+
+def send_fulfillment_to_onestream(connection, event_id: str, data: dict | None = None):  # type: ignore
+    data = _fetch_data(connection, event_id, data)
+    if not data:
+        return
+
+    schema_obj = _map_to_schema(data, event_id)
+    if not schema_obj:
+        return
+
+    try:
+        onestream_payload = _build_onestream_payload(schema_obj)
+        push_records_to_kinesis(
+            kinesis,
+            os.environ.get("ONESTREAM_KINESIS_STREAM_ARN"),
+            [onestream_payload],
+        )
+        logger.info("Successfully pushed to OneStream Kinesis stream: %s", [onestream_payload])
+    except Exception as e:
+        logger.error("Failed to push to OneStream Kinesis stream: %s", str(e))
+        return
+
+
+
+
+
+//////////////////////////////////
+
+# tests/test_onestream.py
+import os
+import importlib
+from datetime import datetime, date
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+
+# ---- Module import (avoid real boto3 client creation at import-time) ----
+@pytest.fixture(scope="module")
+def onestream_module():
+    with patch("boto3.client") as mock_boto_client:
+        mock_boto_client.return_value = MagicMock(name="mock_kinesis_client")
+        from src import onestream as m  # <-- adjust if your package path differs
+        importlib.reload(m)  # ensure patched boto3.client is applied
+        return m
+
+
+# -------------------- Helper tests --------------------
+
+def test_fetch_data_uses_given_data(onestream_module):
+    conn = MagicMock()
+    data_in = {"event_id": "123"}
+    out = onestream_module._fetch_data(conn, "123", data_in)
+    assert out == data_in
+
+
+def test_fetch_data_calls_db_when_data_missing(onestream_module):
+    conn = MagicMock()
+    with patch.object(onestream_module, "get_fulfillment_event_for_onestream") as mock_get:
+        mock_get.return_value = {"event_id": "123"}
+        out = onestream_module._fetch_data(conn, "123", None)
+        mock_get.assert_called_once_with(conn, "123")
+        assert out == {"event_id": "123"}
+
+
+def test_fetch_data_returns_none_when_db_returns_empty(onestream_module):
+    conn = MagicMock()
+    with patch.object(onestream_module, "get_fulfillment_event_for_onestream") as mock_get:
+        mock_get.return_value = None
+        out = onestream_module._fetch_data(conn, "123", None)
+        assert out is None
+
+
+def test_map_to_schema_success(onestream_module):
+    # Mock the Pydantic class constructor
+    with patch.object(onestream_module, "CustomerReferralsFulfillmentActivityV1") as mock_schema:
+        mock_schema.return_value = MagicMock(name="schema_obj")
+        data = {
+            "event_id": "E1",
+            "correlation_id": "C1",
+            "tenant_id": "T1",
+            "creation_timestamp": "2023-10-01T12:00:00Z",
+            "last_updated_timestamp": "2023-10-01T13:00:00Z",
+        }
+        schema_obj = onestream_module._map_to_schema(data, event_id="E1")
+        assert schema_obj is mock_schema.return_value
+
+        # Ensure remaps happened (inputs to schema constructor)
+        kwargs = mock_schema.call_args.kwargs
+        assert kwargs["referral_event_id"] == "E1"
+        assert kwargs["origination_correlation_id"] == "C1"
+        assert kwargs["origination_tenant_id"] == "T1"
+        assert kwargs["creation_utc_timestamp"] == "2023-10-01T12:00:00Z"
+        assert kwargs["last_updated_utc_timestamp"] == "2023-10-01T13:00:00Z"
+
+
+def test_map_to_schema_returns_none_on_exception(onestream_module):
+    with patch.object(onestream_module, "CustomerReferralsFulfillmentActivityV1") as mock_schema:
+        mock_schema.side_effect = Exception("boom")
+        out = onestream_module._map_to_schema({"event_id": "E1"}, event_id="E1")
+        assert out is None
+
+
+def test_build_onestream_payload_normalizes_types(onestream_module, monkeypatch):
+    monkeypatch.setenv("ONESTREAM_SCHEMA_NAME", "test_schema")
+
+    # Build a fake schema object, and mock model_validate/model_dump chain
+    fake_schema_obj = MagicMock(name="schema_obj")
+
+    with patch.object(onestream_module, "CustomerReferralsFulfillmentActivityV1") as mock_schema_cls:
+        mock_schema_cls.model_validate.return_value = MagicMock(
+            model_dump=MagicMock(
+                return_value={
+                    "creation_utc_timestamp": datetime(2023, 10, 1, 12, 0, 0),
+                    "last_updated_utc_timestamp": datetime(2023, 10, 1, 12, 1, 0),
+                    "customer_fulfillment_date": date(2023, 10, 1),
+                    "prospect_fulfillment_date": date(2023, 10, 2),
+                    "customer_fulfilled_amount": 12.34,
+                    "prospect_fulfilled_amount": 56.78,
+                }
+            )
+        )
+
+        payload = onestream_module._build_onestream_payload(fake_schema_obj)
+
+    assert payload["schemaName"] == "test_schema"
+    dp = payload["domainPayload"]
+    assert isinstance(dp["creation_utc_timestamp"], str)
+    assert isinstance(dp["last_updated_utc_timestamp"], str)
+    assert dp["customer_fulfillment_date"] == "2023-10-01"
+    assert dp["prospect_fulfillment_date"] == "2023-10-02"
+    assert dp["customer_fulfilled_amount"] == "12.34"
+    assert dp["prospect_fulfilled_amount"] == "56.78"
+
+
+# -------------------- Main function behavior tests --------------------
+
+@patch.dict(os.environ, {"ONESTREAM_SCHEMA_NAME": "test_schema", "ONESTREAM_KINESIS_STREAM_ARN": "arn:test"})
+def test_send_fulfillment_with_data_success(onestream_module):
+    conn = MagicMock()
+    event_id = "123"
+
+    data = {
+        "event_id": "123",
+        "correlation_id": "c1",
+        "tenant_id": "t1",
+        "creation_timestamp": "2023-10-01T12:00:00Z",
+        "last_updated_timestamp": "2023-10-01T12:01:00Z",
+    }
+
+    with patch.object(onestream_module, "push_records_to_kinesis") as mock_push, \
+         patch.object(onestream_module, "CustomerReferralsFulfillmentActivityV1") as mock_schema_cls:
+
+        fake_schema = MagicMock(name="schema_obj")
+        mock_schema_cls.return_value = fake_schema
+
+        # Make _build_onestream_payload deterministic without relying on Pydantic internals
+        with patch.object(onestream_module, "_build_onestream_payload") as mock_build:
+            mock_build.return_value = {"schemaName": "test_schema", "domainPayload": {"x": 1}}
+
+            onestream_module.send_fulfillment_to_onestream(conn, event_id, data=data)
+
+            mock_push.assert_called_once()
+            args = mock_push.call_args.args
+            assert args[1] == "arn:test"
+            assert args[2] == [{"schemaName": "test_schema", "domainPayload": {"x": 1}}]
+
+
+@patch.dict(os.environ, {"ONESTREAM_SCHEMA_NAME": "test_schema", "ONESTREAM_KINESIS_STREAM_ARN": "arn:test"})
+def test_send_fulfillment_fetch_from_db_success(onestream_module):
+    conn = MagicMock()
+    event_id = "123"
+
+    db_data = {
+        "event_id": "123",
+        "correlation_id": "c1",
+        "tenant_id": "t1",
+        "creation_timestamp": "2023-10-01T12:00:00Z",
+        "last_updated_timestamp": "2023-10-01T12:01:00Z",
+    }
+
+    with patch.object(onestream_module, "get_fulfillment_event_for_onestream") as mock_get, \
+         patch.object(onestream_module, "push_records_to_kinesis") as mock_push, \
+         patch.object(onestream_module, "_build_onestream_payload") as mock_build, \
+         patch.object(onestream_module, "CustomerReferralsFulfillmentActivityV1") as mock_schema_cls:
+
+        mock_get.return_value = db_data
+        mock_schema_cls.return_value = MagicMock(name="schema_obj")
+        mock_build.return_value = {"schemaName": "test_schema", "domainPayload": {"y": 2}}
+
+        onestream_module.send_fulfillment_to_onestream(conn, event_id)
+
+        mock_get.assert_called_once_with(conn, event_id)
+        mock_push.assert_called_once()
+
+
+@patch.dict(os.environ, {"ONESTREAM_SCHEMA_NAME": "test_schema", "ONESTREAM_KINESIS_STREAM_ARN": "arn:test"})
+def test_send_fulfillment_no_data_from_db_does_not_push(onestream_module):
+    conn = MagicMock()
+    event_id = "123"
+
+    with patch.object(onestream_module, "get_fulfillment_event_for_onestream") as mock_get, \
+         patch.object(onestream_module, "push_records_to_kinesis") as mock_push:
+        mock_get.return_value = None
+
+        onestream_module.send_fulfillment_to_onestream(conn, event_id)
+
+        mock_push.assert_not_called()
+
+
+@patch.dict(os.environ, {"ONESTREAM_SCHEMA_NAME": "test_schema", "ONESTREAM_KINESIS_STREAM_ARN": "arn:test"})
+def test_send_fulfillment_schema_mapping_failure_does_not_push(onestream_module):
+    conn = MagicMock()
+    event_id = "123"
+    data = {"event_id": "123"}
+
+    with patch.object(onestream_module, "CustomerReferralsFulfillmentActivityV1") as mock_schema_cls, \
+         patch.object(onestream_module, "push_records_to_kinesis") as mock_push:
+        mock_schema_cls.side_effect = Exception("schema boom")
+
+        onestream_module.send_fulfillment_to_onestream(conn, event_id, data=data)
+
+        mock_push.assert_not_called()
+
+
+@patch.dict(os.environ, {"ONESTREAM_SCHEMA_NAME": "test_schema", "ONESTREAM_KINESIS_STREAM_ARN": "arn:test"})
+def test_send_fulfillment_push_failure_is_handled(onestream_module):
+    conn = MagicMock()
+    event_id = "123"
+    data = {"event_id": "123"}
+
+    with patch.object(onestream_module, "CustomerReferralsFulfillmentActivityV1") as mock_schema_cls, \
+         patch.object(onestream_module, "_build_onestream_payload") as mock_build, \
+         patch.object(onestream_module, "push_records_to_kinesis") as mock_push:
+
+        mock_schema_cls.return_value = MagicMock(name="schema_obj")
+        mock_build.return_value = {"schemaName": "test_schema", "domainPayload": {"z": 3}}
+        mock_push.side_effect = Exception("kinesis boom")
+
+        # Should not raise
+        onestream_module.send_fulfillment_to_onestream(conn, event_id, data=data)
+
