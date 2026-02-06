@@ -1,1 +1,46 @@
-I want you to think like a senior software engineer who is expert in data engineering and databases. Now, let me give you some context on the task. I am running a medical insurance claim related company and we are migrating from MySQL database to StarRocks database. And there are a lot of things that we need to check to ensure that we are migrating properly and also do a level of comparison between the input and output tables, where input table refers to a set of tables that we get some data into and we have our own APIs which does some calculations and stores the result in output tables. So I want you to prepare a thorough plan which involves checking everything from data types to schema level validation and also for a combination. of keys if the results match between both the databases. In that context, now I want you to review all different Databricks notebooks that we are currently using for our validations that are provided in the reference folder. Dig through each one of them, understand their purpose, usage, how they are connecting, and what level of validations we are doing. And let's prepare a more structured, detailed, enhanced debugger script which will run multiple things, such as primary key comparison, schema level comparison, data type level comparison, and you will find exactly what to check and how to check by referencing the existing notebooks. So please go through them first.
+query IntrospectDetailsArgs {
+  __type(name: "TcExhibit") {
+    name
+    fields {
+      name
+      args { name type { kind name ofType { kind name ofType { kind name } } } }
+    }
+  }
+}
+
+
+
+///////////////
+
+
+query IntrospectTcExhibitArgs {
+  __type(name: "Rebates") {
+    name
+    fields {
+      name
+      args { name type { kind name ofType { kind name ofType { kind name } } } }
+    }
+  }
+}
+
+
+
+//////////////////
+
+
+query GetTCExhibitData($uwReqId: String!, $scenarioId: String!, $indicator: String!, $gpi: String!) {
+  rebates(indicator: $indicator) {
+    tcExhibit(uwReqId: $uwReqId, scenarioId: $scenarioId) {
+      uwReqId
+      scenarioId
+      details(gpi: $gpi) {
+        gpi
+        drugName
+        grossPrice
+        benchmarkPrice
+        netPriceUnit
+      }
+      error
+    }
+  }
+}
