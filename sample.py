@@ -1,46 +1,17 @@
-query IntrospectDetailsArgs {
-  __type(name: "TcExhibit") {
-    name
-    fields {
-      name
-      args { name type { kind name ofType { kind name ofType { kind name } } } }
-    }
-  }
-}
-
-
-
-///////////////
-
-
-query IntrospectTcExhibitArgs {
-  __type(name: "Rebates") {
-    name
-    fields {
-      name
-      args { name type { kind name ofType { kind name ofType { kind name } } } }
-    }
-  }
-}
-
-
-
-//////////////////
-
-
-query GetTCExhibitData($uwReqId: String!, $scenarioId: String!, $indicator: String!, $gpi: String!) {
-  rebates(indicator: $indicator) {
-    tcExhibit(uwReqId: $uwReqId, scenarioId: $scenarioId) {
-      uwReqId
-      scenarioId
-      details(gpi: $gpi) {
-        gpi
-        drugName
-        grossPrice
-        benchmarkPrice
-        netPriceUnit
-      }
-      error
-    }
-  }
-}
+SELECT t.*
+FROM comp_engine_microservice_output_qa.pnl_rebate_gpi_tc t
+JOIN (
+    SELECT
+        gpi,
+        proj_year
+    FROM comp_engine_microservice_output_qa.pnl_rebate_gpi_tc
+    WHERE scenario_id = '0806654E4DF2423184E818D213C09241'
+      AND brand_generic = 1
+    GROUP BY gpi, proj_year
+    HAVING COUNT(*) > 1
+) dup
+ON t.gpi = dup.gpi
+AND t.proj_year = dup.proj_year
+WHERE t.scenario_id = '0806654E4DF2423184E818D213C09241'
+  AND t.brand_generic = 1
+ORDER BY t.proj_year, t.gpi;
