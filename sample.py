@@ -134,3 +134,15 @@ echo "  pip install -i \"${ART_BASE}\" --trusted-host \"${ART_HOST}\" \"urllib3=
 echo
 EOF
 chmod +x fix_pipenv_312.sh
+
+
+
+
+/////////////////
+
+
+
+unset HISTFILE
+export ART_USER="YOUR_USERNAME"
+export ART_TOKEN="YOUR_TOKEN"
+./fix_pipenv_312.sh
