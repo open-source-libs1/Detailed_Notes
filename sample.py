@@ -1,51 +1,66 @@
-#!/usr/bin/env bash
-set -euo pipefail
+set -e
 
-###############################################################################
-# Goal:
-# 1) Re-install pipenv (you currently have: zsh: command not found: pipenv)
-# 2) Force the project to use Python 3.12
-# 3) Generate Pipfile.lock successfully
-#
-# NOTE: This assumes your corporate PyPI/Artifactory is:
-# https://artifactory.cloud.capitalone.com/artifactory/api/pypi/pypi-internal/simple
-###############################################################################
-
-echo "==> Step 0: Confirm Python 3.12 exists"
+# ----------------------------
+# Step 0: basic checks
+# ----------------------------
 python3.12 --version
 
-echo "==> Step 1: Configure pip to use Artifactory (for THIS terminal session)"
+# ----------------------------
+# Step 1: Point pip/pipx at Artifactory (IMPORTANT)
+# ----------------------------
 export PIP_INDEX_URL="https://artifactory.cloud.capitalone.com/artifactory/api/pypi/pypi-internal/simple"
 export PIP_TRUSTED_HOST="artifactory.cloud.capitalone.com"
 
-echo "==> Step 2: Install pipenv for your user (no pipx needed)"
-python3.12 -m pip install --user --upgrade pip
-python3.12 -m pip install --user pipenv
+# If your Artifactory needs auth, set these (uncomment and fill):
+# export PIP_INDEX_URL="https://<user>:<token>@artifactory.cloud.capitalone.com/artifactory/api/pypi/pypi-internal/simple"
 
-echo "==> Step 3: Ensure your shell PATH can find user-installed pipenv"
-# macOS user-site bin for Python 3.12:
-export PATH="$HOME/Library/Python/3.12/bin:$PATH"
+# ----------------------------
+# Step 2: Ensure pipx exists
+# ----------------------------
+if ! command -v pipx >/dev/null 2>&1; then
+  echo "pipx not found. Installing via brew..."
+  brew install pipx
+  pipx ensurepath
+  export PATH="$HOME/.local/bin:$PATH"
+fi
 
-echo "==> Step 4: Verify pipenv is available now"
+# ----------------------------
+# Step 3: Install pipenv using pipx with Python 3.12
+# (pipenv was removed earlier, so we re-add it)
+# ----------------------------
+if pipx list | grep -q "pipenv"; then
+  echo "pipenv already installed in pipx; upgrading/reinstalling with python3.12..."
+  pipx reinstall --python python3.12 pipenv || true
+  pipx upgrade pipenv || true
+else
+  echo "Installing pipenv with python3.12..."
+  pipx install --python python3.12 pipenv
+fi
+
+# ----------------------------
+# Step 4: Verify pipenv is back
+# ----------------------------
 pipenv --version
 
-echo "==> Step 5: Move to repo root (update this if needed)"
-# If you're already in the repo, this will do nothing.
-# Otherwise, edit this path.
+# ----------------------------
+# Step 5: Go to repo (edit if your path differs)
+# ----------------------------
 cd "/Users/rcw839/Desktop/Projects/2026/FEB/bank-offers-detail-synchronization"
 pwd
 
-echo "==> Step 6: Remove any existing pipenv virtualenv for this project (safe if none)"
+# ----------------------------
+# Step 6: Force the project venv to use Python 3.12 and generate lock
+# ----------------------------
 pipenv --rm 2>/dev/null || true
 
-echo "==> Step 7: Create project venv using Python 3.12 and install dependencies"
+# Create env + install deps (dev included)
 PIPENV_PYTHON=python3.12 pipenv install --dev
 
-echo "==> Step 8: Confirm the project interpreter is Python 3.12"
+# Confirm interpreter
 pipenv --py
 pipenv run python --version
 
-echo "==> Step 9: Generate lock file"
+# Generate lock file
 PIPENV_PYTHON=python3.12 pipenv lock --clear
 
 echo "✅ Done: Pipfile.lock generated using Python 3.12"
