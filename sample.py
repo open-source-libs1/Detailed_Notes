@@ -1,14 +1,11 @@
-WORKDIR /src
-
-COPY . /src
-
-RUN echo "current directory: $PWD"
-RUN ls
-
-# >>> ADD THESE TWO DEBUG LINES RIGHT HERE <<<
-RUN node -v && npm -v
-RUN npm config get registry && npm config list
-
-# existing lines (leave as-is)
-RUN npm install
-RUN echo "yes" | npm install --production
+DOCKER_BUILDKIT=1 docker build --progress=plain \
+  --build-arg app_env=local \
+  --build-arg oneingest_application=BAOFFERFULFILLMENTENGINE \
+  --build-arg oneingest_schema=deposit_market_decide_incentive_fulfillment_status_updated_v2 \
+  --build-arg devexchange_url=https://api-it.cloud.capitalone.com \
+  --build-arg client_id=3ba05106a04b4faf8af63d1a8c3c58f8 \
+  --build-arg http_proxy=${HTTP_PROXY} \
+  --build-arg https_proxy=${HTTPS_PROXY} \
+  --build-arg no_proxy=${NO_PROXY} \
+  --build-arg DX_CLIENT_SECRET=${CLIENT_SECRET} \
+  -t f1000-docker .
