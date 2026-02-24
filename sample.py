@@ -9,3 +9,24 @@ DOCKER_BUILDKIT=1 docker build --progress=plain \
   --build-arg no_proxy=${NO_PROXY} \
   --build-arg DX_CLIENT_SECRET=${CLIENT_SECRET} \
   -t f1000-docker .
+
+
+    ///////////////////
+
+
+docker run --rm -it -v "$HOME:/host" artifactory-edge-staging.cloud.capitalone.com/baenterprisesharedimages-docker/languages/node:22-ubuntu24.04-202602231446 bash
+
+
+npm config set registry https://artifactory.cloud.capitalone.com/artifactory/api/npm/npm-internalfacing/
+npm login --registry=https://artifactory.cloud.capitalone.com/artifactory/api/npm/npm-internalfacing/
+cp /root/.npmrc /host/.npmrc-f1000
+exit
+
+
+RUN --mount=type=secret,id=npmrc,target=/root/.npmrc npm install
+RUN --mount=type=secret,id=npmrc,target=/root/.npmrc npm install --production
+
+
+export DOCKER_BUILDKIT=1
+docker build --progress=plain --secret id=npmrc,src=$HOME/.npmrc-f1000 -t f1000-docker .
+
