@@ -10,3 +10,7 @@ printf "%s" "$NPM_TOKEN" | docker build \
   --build-arg http_proxy=${HTTP_PROXY} \
   --build-arg DX_CLIENT_SECRET=${CLIENT_SECRET} \
   -t f1000-docker .
+
+
+
+    docker run -p 3001:3001 --network container_default f1000-docker
