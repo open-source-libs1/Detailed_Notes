@@ -1,3 +1,5 @@
-# Install client deps (avoid webpack-cli prompt) and build client
-RUN cd client && npm install --include=dev --legacy-peer-deps --no-audit --no-fund
-RUN cd client && npm run build
+# Put app code in /app (adjust "." if your app code is elsewhere)
+COPY --chown=appuser:appuser . /app
+
+# If you truly need src at runtime (only if something reads /src explicitly)
+COPY --chown=appuser:appuser src/ /src/
