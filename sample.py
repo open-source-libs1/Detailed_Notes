@@ -21,3 +21,13 @@ echo "NO_PROXY=$NO_PROXY"
   export NVM_NODEJS_ORG_MIRROR="https://nodejs.org/dist"
 nvm ls-remote | tail -n 20
 nvm install 24
+
+
+
+/////////////////////
+
+
+export NVM_NODEJS_ORG_MIRROR="https://nodejs.org/dist"
+nvm use 24.14.0
+node -v
+npm -v
