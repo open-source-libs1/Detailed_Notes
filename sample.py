@@ -11,3 +11,13 @@ echo "NVM_NODEJS_ORG_MIRROR=$NVM_NODEJS_ORG_MIRROR"
 echo "HTTP_PROXY=$HTTP_PROXY"
 echo "HTTPS_PROXY=$HTTPS_PROXY"
 echo "NO_PROXY=$NO_PROXY"
+
+
+
+////////////
+
+
+
+  export NVM_NODEJS_ORG_MIRROR="https://nodejs.org/dist"
+nvm ls-remote | tail -n 20
+nvm install 24
