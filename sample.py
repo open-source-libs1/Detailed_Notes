@@ -1,29 +1,34 @@
-# ... everything above stays the same ...
+# syntax=docker/dockerfile:1.7
 
-# keep this (you already had it)
-COPY --chown=appuser:appuser sm_secrets.yaml /app/sm_secrets.yaml
+# (you already have WORKDIR /src and COPY . /src above this)
 
-# Avoid recursive chown (often fails in Jenkins/rootless builders)
-# Just ensure dirs exist; keep runtime user as appuser.
-USER root
-RUN mkdir -p /src /app
+# Create npm auth config using BuildKit secret (token is NOT stored in image layers)
+RUN --mount=type=secret,id=npm_token \
+    set -euo pipefail; \
+    cp .npmrc.template /root/.npmrc; \
+    printf "\n//artifactory.cloud.capitalone.com/artifactory/api/npm/npm-internalfacing/:_authToken=%s\n" \
+      "$(cat /run/secrets/npm_token)" >> /root/.npmrc; \
+    npm ci; \
+    rm -f /root/.npmrc
 
-# (Optional) writable scratch for runtime if needed (safe)
-RUN mkdir -p /tmp/app && chmod 1777 /tmp/app
+# Build client (needs dev deps installed above)
+RUN cd client && npm run build
 
-# No more: RUN chown -R appuser:appuser /src /app   <-- REMOVE THIS
-
-# You already have this copy; keep ONLY ONE copy line (remove the duplicate)
-# COPY --chown=appuser:appuser sm_secrets.yaml /app/sm_secrets.yaml
-
-USER appuser
-
-EXPOSE ${APP_PORT}
-CMD ["node", "/app/index.js"]
+# After build, prune dev deps for runtime image
+RUN npm prune --omit=dev
 
 
-/////////////////////
+
+/////////////////
 
 
+# 1) Load your env locally (your screenshot shows ARTIFACTORY_IDENTITY_TOKEN is in here)
+source .env
+
+# 2) MUST enable BuildKit so --secret works
 export DOCKER_BUILDKIT=1
-docker build --no-cache --progress=plain -f Dockerfile -t payout-ui:test .
+
+# 3) Build, passing the token into build as a secret
+docker build --no-cache --progress=plain \
+  --secret id=npm_token,env=ARTIFACTORY_IDENTITY_TOKEN \
+  -t payout-ui:test .
