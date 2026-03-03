@@ -1,30 +1,29 @@
-# Ensure we can change ownership (Chainguard/Wolfi images often default to non-root)
-USER root
+# ... everything above stays the same ...
 
-# Make sure directories exist before chown
-RUN mkdir -p /src /app
-
-# If you need /src and /app owned by appuser
-RUN chown -R appuser:appuser /src /app
-
-# You already have this copy (keep it)
+# keep this (you already had it)
 COPY --chown=appuser:appuser sm_secrets.yaml /app/sm_secrets.yaml
 
-# Drop back to non-root
+# Avoid recursive chown (often fails in Jenkins/rootless builders)
+# Just ensure dirs exist; keep runtime user as appuser.
+USER root
+RUN mkdir -p /src /app
+
+# (Optional) writable scratch for runtime if needed (safe)
+RUN mkdir -p /tmp/app && chmod 1777 /tmp/app
+
+# No more: RUN chown -R appuser:appuser /src /app   <-- REMOVE THIS
+
+# You already have this copy; keep ONLY ONE copy line (remove the duplicate)
+# COPY --chown=appuser:appuser sm_secrets.yaml /app/sm_secrets.yaml
+
 USER appuser
 
-///////////////////////////
+EXPOSE ${APP_PORT}
+CMD ["node", "/app/index.js"]
 
-
-docker build --no-cache --progress=plain -f Dockerfile.build -t node24-build-test .
-
-
-////////////////
-
-export DOCKER_BUILDKIT=1
-docker build --progress=plain -f Dockerfile -t payout-ui:test .
 
 /////////////////////
 
 
-docker run --rm -it --entrypoint /bin/sh payout-ui:test -lc 'getent passwd appuser || grep appuser /etc/passwd || true'
+export DOCKER_BUILDKIT=1
+docker build --no-cache --progress=plain -f Dockerfile -t payout-ui:test .
