@@ -7,18 +7,11 @@ docker build --progress=plain -f Dockerfile.build -t node24-build-test .
 
 /////////////////
 
+# Create Jenkins user/group (Wolfi/Alpine style)
+RUN addgroup -g 54902 -S jenkins \
+ && adduser  -u 54902 -S -G jenkins -h ${GIT_HOME_DIR} jenkins \
+ && mkdir -p ${GIT_HOME_DIR} \
+ && chown -R 54902:54902 ${GIT_HOME_DIR}
 
-IMG="artifactory-edge-staging.cloud.capitalone.com/baenterprisesharedimages-docker/languages/node:24-chainguard-202602191703"
-
-docker run --rm -it --entrypoint sh "$IMG" -lc '
-set -eux
-id
-cat /etc/os-release || true
-which apk || true
-ls -l /etc/apk || true
-cat /etc/apk/repositories || true
-
-# try the same command that fails in Jenkins
-apk update
-apk add --no-cache git
-'
+USER 54902
+WORKDIR ${GIT_HOME_DIR}
