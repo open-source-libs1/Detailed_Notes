@@ -1,43 +1,27 @@
-WORKDIR /src
+FROM artifactory-edge-staging.cloud.capitalone.com/baenterprisesharedimages-docker/languages/node:24-dev-chainguard-202602261420 AS builder
 
+WORKDIR /src
 COPY . /src
 
-# Install server dependencies
-RUN npm install
-RUN echo "yes" | npm install --production
+RUN ["apk", "add", "--no-cache", "coreutils"]
+RUN ["npm", "install"]
+RUN ["npm", "install", "--production"]
+RUN ["npm", "install", "--save", "@opentelemetry/api"]
+RUN ["npm", "install", "--save", "@opentelemetry/auto-instrumentations-node"]
 
-# Auto instrumentation
-RUN npm install --save @opentelemetry/api \
- && npm install --save @opentelemetry/auto-instrumentations-node
-
-# Build client in BUILD image, not runtime image
 WORKDIR /src/client
-RUN npm install --legacy-peer-deps --no-audit --no-fund
-RUN npm run build
-
-# Return to repo root
-WORKDIR /src
+RUN ["npm", "install", "--legacy-peer-deps", "--no-audit", "--no-fund"]
+RUN ["npm", "run", "build"]
 
 
-/////////////////////////
+////////////////
 
 
-# Runtime image only - do not run npm install / npm build here
+WORKDIR /app
+COPY --from=builder /src /app
 COPY sm_secrets.yaml /app/sm_secrets.yaml
 
-# Copy already-built client assets from build context/artifact path
-# Keep this only if your runtime serves the built UI
-COPY client/build /app/client/build
-
-# Distroless-safe runtime user
 USER 1000
 
 EXPOSE ${APP_PORT}
 CMD ["node", "/app/index.js"]
-
-
-
-////////////////////
-
-
-
