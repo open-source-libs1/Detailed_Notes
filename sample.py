@@ -1,4 +1,10 @@
+WORKDIR /src
+COPY --from=builder /src /src
+COPY --from=builder /src /app
+COPY sm_secrets.yaml /src/sm_secrets.yaml
+COPY sm_secrets.yaml /app/sm_secrets.yaml
 
-RUN ["npm", "install", "webpack", "webpack-cli", "mini-css-extract-plugin", "--legacy-peer-deps", "--no-audit", "--no-fund"]
-RUN ["npm", "install", "--legacy-peer-deps", "--no-audit", "--no-fund"]
-RUN ["npm", "run", "build"]
+USER 1000
+
+EXPOSE ${APP_PORT}
+CMD ["node", "/src/app/index.js"]
