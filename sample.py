@@ -1,8 +1,8 @@
 WORKDIR /src
-COPY --from=builder /src /src
-COPY --from=builder /src /app
-COPY sm_secrets.yaml /src/sm_secrets.yaml
-COPY sm_secrets.yaml /app/sm_secrets.yaml
+COPY --from=builder --chown=1000:1000 /src /src
+COPY --from=builder --chown=1000:1000 /src /app
+COPY --chown=1000:1000 sm_secrets.yaml /src/sm_secrets.yaml
+COPY --chown=1000:1000 sm_secrets.yaml /app/sm_secrets.yaml
 
 USER 1000
 
