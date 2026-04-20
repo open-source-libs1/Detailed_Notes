@@ -1,19 +1,16 @@
-
+filter asv = "ASVOFFERFULFILLMENTENGINE"
+filter logGroup ~ "/aws/ecs/fargate/BAOFFERFULFILLMENTENGINE/prodf1000-docker/"
+filter cloudwatch_log ~ "{\"level\":\"info\",\"message\":\"processing /payout/offers request\""
+statsby count()
 
 
 filter asv = "ASVOFFERFULFILLMENTENGINE"
 filter logGroup ~ "/aws/ecs/fargate/BAOFFERFULFILLMENTENGINE/prodf1000-docker/"
-filter cloudwatch_log ~ "\"message\":\"processing /payout/offers request\""
-filter not (cloudwatch_log ~ "attempting to send Payload")
-filter not (cloudwatch_log ~ "account_number_tokenized")
-sort timestamp desc
-
+filter cloudwatch_log ~ "{\"level\":\"info\",\"message\":\"completed /payout/offers request\""
+statsby count()
 
 
 filter asv = "ASVOFFERFULFILLMENTENGINE"
 filter logGroup ~ "/aws/ecs/fargate/BAOFFERFULFILLMENTENGINE/prodf1000-docker/"
-filter cloudwatch_log ~ "processing /payout/offers request"
-filter not (cloudwatch_log ~ "attempting to send Payload")
-filter not (cloudwatch_log ~ "On")
-filter not (cloudwatch_log ~ "account_number_tokenized")
+filter cloudwatch_log ~ "{\"level\":\"info\",\"message\":\"completed /payout/offers request\""
 sort timestamp desc
