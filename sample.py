@@ -1,56 +1,30 @@
-package com.capitalone.api.deposits.promotions.configuration;
+package com.capitalone.api.deposits.promotions.service;
 
-import com.capitalone.experimentationservice.api.ExperimentationServiceClient;
-import com.capitalone.experimentationservice.api.avaje.AvajeExperimentationServiceClient;
-import com.capitalone.experimentationservice.api.avaje.ExperimentationServiceApi;
-import com.capitalone.openfeature.providers.CofOptimizelyOptions;
-import com.capitalone.openfeature.providers.CofOptimizelyProvider;
 import dev.openfeature.sdk.Client;
-import dev.openfeature.sdk.OpenFeatureAPI;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
+import org.springframework.boot.CommandLineRunner;
+import org.springframework.stereotype.Component;
 
-@Configuration
-public class OptimizelyOpenFeatureConfiguration {
+@Component
+public class FeatureFlagStartupPrinter implements CommandLineRunner {
 
-    private static final Logger log =
-            LoggerFactory.getLogger(OptimizelyOpenFeatureConfiguration.class);
+    private static final Logger log = LoggerFactory.getLogger(FeatureFlagStartupPrinter.class);
+    private static final String FLAG_KEY = "aussiedor_targeted_incentive_eligibility_enabled";
 
-    @Bean
-    public Client openFeatureClient() throws Exception {
-        String clientId = System.getenv("CLIENT_ID");
-        String clientSecret = System.getenv("CLIENT_SECRET");
-        String appName = System.getenv("OPTIMIZELY_APP_NAME");
-        String appEnv = System.getenv("OPTIMIZELY_APP_ENV");
+    private final Client client;
 
-        log.info("Initializing Optimizely OpenFeature client. appName={}, appEnv={}", appName, appEnv);
+    public FeatureFlagStartupPrinter(Client client) {
+        this.client = client;
+    }
 
-        ExperimentationServiceClient exchangeClient =
-                new AvajeExperimentationServiceClient(
-                        new ExperimentationServiceApi.Builder()
-                                .clientId(clientId)
-                                .clientSecret(clientSecret)
-                                .baseUrl("https://api-it.cloud.capitalone.com")
-                                .build());
-
-        CofOptimizelyOptions options =
-                CofOptimizelyOptions.builder()
-                        .appName(appName)
-                        .appEnv(appEnv)
-                        .xUpstreamEnv("non-ease")
-                        .experimentationServiceClient(exchangeClient)
-                        .simpleCache()
-                        .build();
-
-        CofOptimizelyProvider provider = new CofOptimizelyProvider(options);
-
-        OpenFeatureAPI openFeatureAPI = OpenFeatureAPI.getInstance();
-        openFeatureAPI.setProviderAndWait(provider);
-
-        log.info("Optimizely OpenFeature provider initialized successfully.");
-
-        return openFeatureAPI.getClient();
+    @Override
+    public void run(String... args) {
+        try {
+            boolean flagValue = client.getBooleanValue(FLAG_KEY, false);
+            log.info("Optimizely flag [{}] resolved to [{}]", FLAG_KEY, flagValue);
+        } catch (Exception e) {
+            log.error("Failed to evaluate Optimizely flag at startup", e);
+        }
     }
 }
