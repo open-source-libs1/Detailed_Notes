@@ -147,3 +147,13 @@ class DepositsPromoContract(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+
+
+
+No, this is not intended to swap out the existing client for all feature flags.
+The existing oauthWebClient path is still being passed into FeatureFlagServiceImpl, and the new openFeatureClient is only being added so we can evaluate the new Optimizely-backed flag.
+Existing flags do not all need to be created in Optimizely as part of this change.
+This PR is meant to support the new targeted incentive eligibility flag only, while preserving current behavior for the existing flags.
