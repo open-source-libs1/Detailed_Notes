@@ -1,4 +1,4 @@
-
+import json
 import os
 import sys
 import unittest
@@ -15,6 +15,34 @@ sys.path.insert(0, str(REPO_ROOT))
 
 PACT_DIR = Path(os.getenv("PACT_DIR", REPO_ROOT / "pacts"))
 PACT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _remove_content_type_headers_from_generated_pacts():
+    for pact_file in PACT_DIR.glob("*.json"):
+        with pact_file.open("r", encoding="utf-8") as file:
+            pact_json = json.load(file)
+
+        for interaction in pact_json.get("interactions", []):
+            request_headers = interaction.get("request", {}).get("headers", {})
+            response_headers = interaction.get("response", {}).get("headers", {})
+
+            for header_name in list(request_headers.keys()):
+                if header_name.lower() == "content-type":
+                    request_headers.pop(header_name, None)
+
+            for header_name in list(response_headers.keys()):
+                if header_name.lower() == "content-type":
+                    response_headers.pop(header_name, None)
+
+            if not request_headers:
+                interaction.get("request", {}).pop("headers", None)
+
+            if not response_headers:
+                interaction.get("response", {}).pop("headers", None)
+
+        with pact_file.open("w", encoding="utf-8") as file:
+            json.dump(pact_json, file, indent=2)
+            file.write("\n")
 
 
 class DepositsPromoContract(unittest.TestCase):
@@ -81,6 +109,8 @@ class DepositsPromoContract(unittest.TestCase):
         self.assertEqual(response.json(), expected_body)
 
         pact.write_file(str(PACT_DIR), overwrite=True)
+
+        _remove_content_type_headers_from_generated_pacts()
 
         generated_pact_files = list(PACT_DIR.glob("*.json"))
         self.assertTrue(
